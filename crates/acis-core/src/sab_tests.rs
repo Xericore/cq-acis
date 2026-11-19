@@ -590,3 +590,229 @@ fn explicit_asm_surface_decodes_tensor_order_and_refuses_trailer_changes() {
     periodic.values[9] = I(2.into());
     assert!(crate::asm_nurbs::decode(&periodic, 22700).is_err());
 }
+
+// Transform records in both forms. D0_TRANSFORM_RECORD is a real binary record
+// (an AutoCAD 2018 drawing, ASM 4-byte words) and D0_VALUES its 12 stored
+// doubles, independently decoded (as f64 bit patterns; hex-float in comments).
+// STAIRS_TEXT_TRANSFORM_RECORD is a real text record of the same exporter.
+const D0_TRANSFORM_RECORD: &str = concat!(
+    "0d097472616e73666f726d0cffffffff04ffffffff",
+    "1418c67a91d2a9a6bf1d363e861786ee3ffcb3f32e1e01d33f",
+    "14bdd23137c2308c3f15aa5153e3fbd2bfc9b18e3d808eee3f",
+    "143991789931f7ef3fa4fe68bfdfbba73f0000000000c0dbbc",
+    "14ff2e67e051e65e40a52a7802cffd55c03e72d539e40ba740",
+    "06000000000000f03f",
+    "0a0b0b11",
+);
+const D0_VALUES: [u64; 12] = [
+    0xbfa6a9d2917ac618, // -0x1.6a9d2917ac618p-5
+    0x3fee8617863e361d, // 0x1.e8617863e361dp-1
+    0x3fd3011e2ef3b3fc, // 0x1.3011e2ef3b3fcp-2
+    0x3f8c30c23731d2bd, // 0x1.c30c23731d2bdp-7
+    0xbfd2fbe35351aa15, // -0x1.2fbe35351aa15p-2
+    0x3fee8e803d8eb1c9, // 0x1.e8e803d8eb1c9p-1
+    0x3feff73199789139, // 0x1.ff73199789139p-1
+    0x3fa7bbdfbf68fea4, // 0x1.7bbdfbf68fea4p-5
+    0xbcdbc00000000000, // -0x1.bc00000000000p-50
+    0x405ee651e0672eff, // 0x1.ee651e0672effp+6
+    0xc055fdcf02782aa5, // -0x1.5fdcf02782aa5p+6
+    0x40a70be439d5723e, // 0x1.70be439d5723ep+11
+];
+const STAIRS_TEXT_TRANSFORM_RECORD: &str = concat!(
+    "0d097472616e73666f726d0cffffffff04ffffffff",
+    "125e000000",
+    "3120302030203020312030203020302031203137352e3230353135313833303639323834",
+    "202d3333362e393530373632303037323439393820313035362031206e6f5f726f746174",
+    "65206e6f5f7265666c656374206e6f5f736865617220",
+    "11",
+);
+const STAIRS_TEXT_VALUES: [u64; 12] = [
+    0x3ff0000000000000, // 1
+    0x0000000000000000,
+    0x0000000000000000,
+    0x0000000000000000,
+    0x3ff0000000000000, // 1
+    0x0000000000000000,
+    0x0000000000000000,
+    0x0000000000000000,
+    0x3ff0000000000000, // 1
+    0x4065e6909a92714a, // 175.20515183069284
+    0xc0750f365238f6b0, // -336.95076200724998
+    0x4090800000000000, // 1056
+];
+fn hex_bytes(hex: &str) -> Vec<u8> {
+    assert!(hex.len() % 2 == 0);
+    (0..hex.len())
+        .step_by(2)
+        .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+        .collect()
+}
+/// A 4-byte ASM document whose record 1 is `record` (identifier through 0x11).
+fn document_with(record: &[u8]) -> Vec<u8> {
+    let mut data = fixture(4, 0, None);
+    data.truncate(data.len() - 17); // drop the End-of-ASM-data identifier
+    data.extend_from_slice(record);
+    name(&mut data, "End-of-ASM-data");
+    data
+}
+fn binary_fields(vectors: [[f64; 3]; 4], scale: f64, flags: [bool; 3]) -> Vec<u8> {
+    let mut fields: Vec<u8> = Vec::new();
+    for xyz in vectors {
+        fields.push(20);
+        for x in xyz {
+            fields.extend_from_slice(&x.to_le_bytes());
+        }
+    }
+    real(&mut fields, scale);
+    fields.extend(flags.map(|f| if f { 10u8 } else { 11u8 }));
+    fields
+}
+fn text_fields(text: &str) -> Vec<u8> {
+    let mut fields = vec![18];
+    word(&mut fields, text.len() as i64, 4);
+    fields.extend_from_slice(text.as_bytes());
+    fields
+}
+fn transform_of(data: &[u8]) -> TransformEntity {
+    let doc = parse(data).unwrap();
+    match &doc.model.entities()[1] {
+        Entity::Transform(t) => t.clone(),
+        other => panic!("transform not decoded: {}", other.raw().type_name),
+    }
+}
+const IDENTITY_AT_10_20_30: [[f64; 3]; 4] = [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.], [10., 20., 30.]];
+
+#[test]
+fn binary_transform_decodes() {
+    let record = hex_bytes(D0_TRANSFORM_RECORD);
+    let data = document_with(&record);
+    let doc = parse(&data).unwrap();
+    let Entity::Transform(t) = &doc.model.entities()[1] else {
+        panic!("binary transform not decoded")
+    };
+    assert_eq!(t.matrix_values.map(f64::to_bits), D0_VALUES);
+    assert_eq!(t.scale, 1.);
+    let span = t.raw.source.as_ref().unwrap();
+    assert_eq!(&data[span.start_offset..span.end_offset], &record[..]);
+    assert!(doc
+        .model
+        .diagnostics()
+        .iter()
+        .all(|d| d.code != "sab.entity_schema_unsupported"));
+    // Stored order is the row layout: x maps to the first vector, the origin to the translation.
+    let [a, b, c, ..] = t.matrix_values;
+    assert_eq!(t.transform_vector(Vec3::from((1., 0., 0.))), Vec3::from((a, b, c)));
+    let [.., x, y, z] = t.matrix_values;
+    assert_eq!(t.transform_point(Vec3::from((0., 0., 0.))), Vec3::from((x, y, z)));
+}
+
+#[test]
+fn binary_transform_flags_recorded_not_applied() {
+    for flags in [
+        [false, false, false],
+        [true, false, false],
+        [false, true, false],
+        [false, false, true],
+        [true, true, true],
+    ] {
+        let fields = binary_fields(IDENTITY_AT_10_20_30, 1., flags);
+        let t = transform_of(&fixture(4, 0, Some(("transform", fields))));
+        assert_eq!((t.rotated, t.reflected, t.sheared), (flags[0], flags[1], flags[2]));
+        assert_eq!(
+            t.matrix_values,
+            [1., 0., 0., 0., 1., 0., 0., 0., 1., 10., 20., 30.]
+        );
+        assert_eq!(t.linear_determinant(), 1.);
+        assert_eq!(t.transform_point(Vec3::from((1., 2., 3.))), Vec3::from((11., 22., 33.)));
+    }
+    let d0 = transform_of(&document_with(&hex_bytes(D0_TRANSFORM_RECORD)));
+    assert_eq!((d0.rotated, d0.reflected, d0.sheared), (true, false, false));
+}
+
+#[test]
+fn text_transform_unchanged() {
+    // The row-vector example of tests/geometry.rs, read through the SAB text form.
+    let text = "0 1 0 1 0 0 0 0 1 10 20 30 2 rotate reflect no_shear";
+    let t = transform_of(&fixture(4, 0, Some(("transform", text_fields(text)))));
+    assert_eq!(t.matrix_values, [0., 1., 0., 1., 0., 0., 0., 0., 1., 10., 20., 30.]);
+    assert_eq!(t.scale, 2.);
+    assert_eq!((t.rotated, t.reflected, t.sheared), (true, true, false));
+    assert_eq!(t.linear_determinant(), -8.);
+    assert_eq!(t.transform_vector(Vec3::from((1., 2., 3.))), Vec3::from((4., 2., 6.)));
+    assert_eq!(t.transform_point(Vec3::from((1., 2., 3.))), Vec3::from((14., 22., 36.)));
+    // A real text record: a pure translation, all flags off.
+    let record = hex_bytes(STAIRS_TEXT_TRANSFORM_RECORD);
+    let data = document_with(&record);
+    let t = transform_of(&data);
+    assert_eq!(t.matrix_values.map(f64::to_bits), STAIRS_TEXT_VALUES);
+    assert_eq!(t.scale, 1.);
+    assert_eq!((t.rotated, t.reflected, t.sheared), (false, false, false));
+    let span = t.raw.source.as_ref().unwrap();
+    assert_eq!(&data[span.start_offset..span.end_offset], &record[..]);
+}
+
+#[test]
+fn text_transform_flags_available() {
+    // The Python model exposes these flags as rotate/reflect/shear for both forms.
+    let words = "1 0 0 0 1 0 0 0 1 175.20515183069284 -336.95076200724998 1056 1";
+    let plain = transform_of(&fixture(
+        4,
+        0,
+        Some(("transform", text_fields(&format!("{words} no_rotate no_reflect no_shear ")))),
+    ));
+    assert_eq!(plain.matrix_values.map(f64::to_bits), STAIRS_TEXT_VALUES);
+    for (flags, expected) in [
+        ("rotate no_reflect no_shear", (true, false, false)),
+        ("no_rotate reflect no_shear", (false, true, false)),
+        ("no_rotate no_reflect shear", (false, false, true)),
+        ("rotate reflect shear", (true, true, true)),
+    ] {
+        let fields = text_fields(&format!("{words} {flags}"));
+        let t = transform_of(&fixture(4, 0, Some(("transform", fields))));
+        assert_eq!((t.rotated, t.reflected, t.sheared), expected);
+        assert_eq!(
+            t.matrix_values.map(f64::to_bits),
+            plain.matrix_values.map(f64::to_bits)
+        );
+        assert_eq!(t.scale.to_bits(), plain.scale.to_bits());
+    }
+    let fields = text_fields(&format!("{words} rotated no_reflect no_shear"));
+    let doc = parse(&fixture(4, 0, Some(("transform", fields)))).unwrap();
+    assert!(matches!(doc.model.entities()[1], Entity::Raw(_)));
+}
+
+#[test]
+fn binary_transform_malformed_stays_raw() {
+    let full = binary_fields(IDENTITY_AT_10_20_30, 1., [false; 3]);
+    let mut three_vectors = full.clone();
+    three_vectors.drain(75..100); // drop the translation vector
+    let missing_boolean = full[..full.len() - 1].to_vec();
+    let mut trailing = full.clone();
+    trailing.push(11);
+    let mut nan_vector = IDENTITY_AT_10_20_30;
+    nan_vector[1][2] = f64::NAN;
+    let mut infinite_translation = IDENTITY_AT_10_20_30;
+    infinite_translation[3][0] = f64::INFINITY;
+    for fields in [
+        three_vectors,
+        missing_boolean,
+        trailing,
+        binary_fields(nan_vector, 1., [false; 3]),
+        binary_fields(infinite_translation, 1., [false; 3]),
+        binary_fields(IDENTITY_AT_10_20_30, f64::NAN, [false; 3]),
+    ] {
+        let data = fixture(4, 0, Some(("transform", fields)));
+        let doc = parse(&data).unwrap();
+        let Entity::Raw(raw) = &doc.model.entities()[1] else {
+            panic!("malformed binary transform was decoded")
+        };
+        assert_eq!(raw.type_name, "transform");
+        let span = raw.source.as_ref().unwrap();
+        assert_eq!(raw.raw_data.as_deref(), Some(&data[span.start_offset..span.end_offset]));
+        assert!(doc
+            .model
+            .diagnostics()
+            .iter()
+            .any(|d| d.code == "sab.entity_schema_unsupported" && d.entity_index == Some(1)));
+    }
+}

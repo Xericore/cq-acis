@@ -487,6 +487,10 @@ impl Reader<'_> {
         self.pos += 1;
         Ok(&t.value)
     }
+    /// The next field without consuming it (None at the end of the record).
+    fn peek(&self) -> Option<&Value> {
+        self.tokens.get(self.pos).map(|t| &t.value)
+    }
     fn reference(&mut self) -> Result<EntityRef> {
         match self.next()? {
             Value::Ref(v) => Ok(*v),
@@ -749,6 +753,31 @@ fn decode(r: &mut Reader<'_>, raw: RawEntity) -> Result<Option<Entity>> {
             u_range: r.range()?,
             v_range: r.range()?,
         }),
+        // Binary form (e.g. AutoCAD ASM SAB): the three linear 3-vectors, the
+        // translation, the scale, then the rotate, reflect and shear Booleans.
+        // The values keep their stored order, the row-vector layout the text
+        // form uses (point * matrix + translation). The flags are recorded,
+        // never applied: the matrix alone defines the placement.
+        "transform" if matches!(r.peek(), Some(Value::Vec3(_))) => {
+            let v1 = r.vector()?;
+            let v2 = r.vector()?;
+            let v3 = r.vector()?;
+            let t = r.vector()?;
+            let scale = r.number()?;
+            let rotated = r.boolean()?;
+            let reflected = r.boolean()?;
+            let sheared = r.boolean()?;
+            Entity::Transform(TransformEntity {
+                raw,
+                matrix_values: [
+                    v1.x, v1.y, v1.z, v2.x, v2.y, v2.z, v3.x, v3.y, v3.z, t.x, t.y, t.z,
+                ],
+                scale,
+                rotated,
+                reflected,
+                sheared,
+            })
+        }
         "transform" => {
             let text = r.text()?;
             let words = text.split_whitespace().collect::<Vec<_>>();

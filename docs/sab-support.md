@@ -18,6 +18,9 @@ requirements. Other signatures or save versions raise `ValueError`.
 
 Typed records include body, lump, shell, face, loop, coedge, edge, vertex,
 point, straight, ellipse, plane, cone/cylinder, sphere, torus, and transform.
+A transform is read in its text form (one 16-word string) or its binary form
+(four 3-vectors, a double scale and three Booleans); both give the same
+row-vector `matrix_values` layout and the `rotate`/`reflect`/`shear` flags.
 Names with `-curve` and `-surface` suffixes are accepted. Unknown entities,
 attributes, and unfamiliar layouts remain `RawEntity`; schema limitations are
 reported with `sab.entity_schema_unsupported`. See [geometry support](geometry-support.md)

@@ -414,6 +414,20 @@ class TransformEntity(DecodedEntity):
     reflected: bool
     sheared: bool
 
+    # The flags under their ACIS record keywords (rotate, reflect, shear), for
+    # both the text and the binary record form. Recorded, never applied.
+    @property
+    def rotate(self) -> bool:
+        return self.rotated
+
+    @property
+    def reflect(self) -> bool:
+        return self.reflected
+
+    @property
+    def shear(self) -> bool:
+        return self.sheared
+
     @property
     def linear_determinant(self) -> float:
         return _native.geometry(self, "linear_determinant", ())
