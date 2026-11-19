@@ -1695,7 +1695,10 @@ class CadQueryConverter:
         from ._cylinder_slits import cylinder_slit_face
         slit_face = cylinder_slit_face(self, face, surface, loops, placement, geometry)
         if slit_face is not None:
-            return self._reverse_face(slit_face) if face.reversed != surface.reversed else slit_face
+            # The slit builder already orients the face by its lower rim's coedge
+            # direction (the ACIS loop rule, which carries the face sense); a
+            # further flip would apply the sense twice (dwg2glb 0003).
+            return slit_face
         apex_face = self._cone_apex_face(face, surface, loops, placement, geometry)
         if apex_face is not None:
             return apex_face
@@ -1754,7 +1757,10 @@ class CadQueryConverter:
             raise CadQueryConversionError(
                 f"face ${face.index}: CadQuery could not trim the cylinder/cone surface"
             ) from error
-        if face.reversed != surface.reversed:
+        # ACIS cone sense: away from the axis for cos > 0, toward it for cos < 0;
+        # the OCCT surface (frame axis axis*cos) always points away, and
+        # surface.reversed is ACIS reverse_u, a parameter direction (dwg2glb 0003).
+        if face.reversed != (surface.cos_half_angle < 0):
             result = self._reverse_face(result)
         return result
 
@@ -1810,7 +1816,7 @@ class CadQueryConverter:
             raise CadQueryConversionError("elliptical cone affine face is invalid", code="geometry.face_invalid")
         self.analytic_trim_faces.append({"face": face.index,
             "method": "elliptical_cone_affine_isosections", "loops": [l.index for l in loops]})
-        return self._reverse_face(faces[0]) if face.reversed ^ surface.reversed else faces[0]
+        return self._reverse_face(faces[0]) if face.reversed != (surface.cos_half_angle < 0) else faces[0]
 
     def _cone_apex_face(self, face, surface, loops, placement, geometry):
         """A complete circular rim and one source null loop at a proven apex.
@@ -1861,7 +1867,7 @@ class CadQueryConverter:
             return None
         self._edge(ring_coedge, placement)  # Validate the source rim and its trim.
         # The explicit apex loop selects the unique finite side of the rim.
-        flip = face.reversed ^ surface.reversed
+        flip = face.reversed != (surface.cos_half_angle < 0)
         builder = BRepBuilderAPI_MakeFace(geometry.surface, 0., 2 * math.pi,
                                          min(v, apex_v), max(v, apex_v), self.tolerance)
         if not builder.IsDone():
@@ -1981,7 +1987,8 @@ class CadQueryConverter:
             return None
         boundaries = []
         signed_radius = surface.radius if isinstance(surface, SphereSurfaceEntity) else surface.minor_radius
-        flip = face.reversed ^ surface.reversed ^ (signed_radius < 0)
+        # A torus's Boolean is ACIS reverse_v, a parameter direction; the sphere's is kept (dwg2glb 0003).
+        flip = face.reversed ^ (isinstance(surface, SphereSurfaceEntity) and surface.reversed) ^ (signed_radius < 0)
         for loop in loops:
             coedge = self._coedges(loop)[0]
             edge = self._edge(coedge, placement)
@@ -2059,7 +2066,7 @@ class CadQueryConverter:
             raise CadQueryConversionError(f"face ${face.index}: analytic trim failed")
         result = self.cq.Face(builder.Face())
         signed_radius = surface.radius if isinstance(surface, SphereSurfaceEntity) else surface.minor_radius
-        if face.reversed ^ surface.reversed ^ (signed_radius < 0):
+        if face.reversed ^ (isinstance(surface, SphereSurfaceEntity) and surface.reversed) ^ (signed_radius < 0):
             result = self._reverse_face(result)
         return result
 
