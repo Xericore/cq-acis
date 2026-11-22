@@ -296,31 +296,39 @@ def periodic_seam_face(converter, face, loops, wires, geometry, placement, *, af
         converter.periodic_seam_refusals.append(dict(face=face.index, reason=reason, after_heal=after_heal))
         return None
 
+    def copied(sources):
+        # The seam is built on copies: the caller's wires are never touched, whatever the outcome.
+        return tuple(converter.cq.Wire(TopoDS.Wire_s(BRepBuilderAPI_Copy(wire.wrapped, False, False).Shape()))
+                     for wire in sources)
+
     if not isinstance(geometry.surface, (Geom_CylindricalSurface, Geom_ConicalSurface)):
         return refuse('support is not a circular cylinder or cone')
-    source_surface = converter._resolve_geometry(face.surface)
-    if not after_heal and converter._face_uses_approximation(source_surface, loops):
-        copies = tuple(converter.cq.Wire(TopoDS.Wire_s(BRepBuilderAPI_Copy(wire.wrapped, False, False).Shape()))
-                       for wire in wires)
-        converter._deferred_periodic_seams[face.index] = dict(
-            loops=loops, wires=copies, geometry=geometry, placement=placement,
-            flip=face.reversed != (source_surface.cos_half_angle < 0))
-        return None
-    if placement.orientation_sign <= 0:
-        return refuse('mirrored placement')
-    reason = _unqualified_source(converter, face, loops, wires, placement)
-    if reason is not None:
-        return refuse(reason)
+    # Fail closed: an OCCT failure or a conversion error anywhere in the seam code is a refusal of the seam
+    # path, so the face stays geometry.face_invalid (never another code, never a later 'could not sew').
     try:
-        result, record = _compose_periodic_seam(converter, wires, geometry)
+        source_surface = converter._resolve_geometry(face.surface)
+        if not after_heal and converter._face_uses_approximation(source_surface, loops):
+            converter._deferred_periodic_seams[face.index] = dict(
+                loops=loops, wires=copied(wires), geometry=geometry, placement=placement,
+                flip=face.reversed != (source_surface.cos_half_angle < 0))
+            return None
+        if placement.orientation_sign <= 0:
+            return refuse('mirrored placement')
+        reason = _unqualified_source(converter, face, loops, wires, placement)
+        if reason is not None:
+            return refuse(reason)
+        # A deferred face already holds the copies taken before the heal ran (and used nowhere else).
+        result, record = _compose_periodic_seam(converter, wires if after_heal else copied(wires), geometry)
+        converter.periodic_seam_faces.append(dict(face=face.index, loops=[loop.index for loop in loops],
+            edges=[co.edge.index for loop in loops for co in converter._coedges(loop)],
+            method=('dwg2glb periodic chart seam clear of every source vertex and hole; exact-inverse UV curves; '
+                    'unchanged oriented 3D curves and complete trim intervals'),
+            after_heal=after_heal, **record))
+        return result
     except _Refusal as refusal:
         return refuse(str(refusal))
-    converter.periodic_seam_faces.append(dict(face=face.index, loops=[loop.index for loop in loops],
-        edges=[co.edge.index for loop in loops for co in converter._coedges(loop)],
-        method=('dwg2glb periodic chart seam clear of every source vertex and hole; exact-inverse UV curves; '
-                'unchanged oriented 3D curves and complete trim intervals'),
-        after_heal=after_heal, **record))
-    return result
+    except Exception as error:  # OCP Standard_Failure, CadQueryConversionError from a deviation check, ...
+        return refuse(f'{type(error).__name__}: {error}')
 
 
 def periodic_seam_after_heal(converter, face, deferred, healed):

@@ -6,7 +6,10 @@ that does not qualify stays ``geometry.face_invalid``.
 """
 from dataclasses import replace
 import math
+import os
+import tempfile
 import unittest
+from unittest import mock
 
 import cq_acis as a
 from cq_acis.cadquery import _Placement
@@ -63,6 +66,25 @@ class FaceModel:
         i = self._reserve()
         self.entries[i] = a.BSplineCurveEntity(raw(i, 'intcurve-curve'), N, 2, (0., .25, .5, .75, 1.),
                                                (3, 2, 2, 2, 3), poles, weights, None, 0.)
+        return R(i)
+
+    def stored_fit_circle(self, z, radius, tolerance=1e-3):
+        """A raw ``int_int_cur`` record with ASM's stored cubic fit of a circle (four Bezier quadrants, the
+        parameter is the angle): not an exact curve, so the face counts as bounded by a stored fit."""
+        kappa = 4 / 3 * math.tan(math.pi / 8)
+        poles = []
+        for k in range(4):
+            a0, a1 = k * math.pi / 2, (k + 1) * math.pi / 2
+            (c0, s0), (c1, s1) = (math.cos(a0), math.sin(a0)), (math.cos(a1), math.sin(a1))
+            quadrant = [(radius * c0, radius * s0), (radius * (c0 - kappa * s0), radius * (s0 + kappa * c0)),
+                        (radius * (c1 + kappa * s1), radius * (s1 - kappa * c1)), (radius * c1, radius * s1)]
+            poles.extend(quadrant if k == 0 else quadrant[1:])
+        knots = [value for k in range(5) for value in (k * math.pi / 2, 3)]
+        fit = ('nubs', 3, 0, 5, *knots, *[c for x, y in poles for c in (x, y, z)], tolerance)
+        values = (N, b'\x0b', b'\x0f', 'int_int_cur', 22220, 0, *fit,
+                  'null_surface', 'null_surface', 'nullbs', 'nullbs', b'\x10', b'\x0b', b'\x0b')
+        i = self._reserve()
+        self.entries[i] = a.RawEntity(i, 'intcurve-curve', N, None, values)
         return R(i)
 
     def loop(self, uses):
@@ -135,12 +157,12 @@ def reversed_loops(m):
         m.loops[k] = (loop_index, order[0])
 
 
-class PeriodicSeamTests(unittest.TestCase):
+class SeamChecks(unittest.TestCase):
     def convert(self, model):
         c = a.CadQueryConverter(model)
         return c, c._face(model.entities[0], _Placement(None, 1.))
 
-    def assert_qualified_seam(self, c, model, face, area, holes, radial_sign=1., normal_at=None):
+    def assert_qualified_seam(self, c, model, face, area, holes, radial_sign=1., normal_at=None, edge_limit=None):
         from OCP.BRep import BRep_Tool
         from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeVertex
         from OCP.BRepExtrema import BRepExtrema_DistShapeShape
@@ -166,7 +188,11 @@ class PeriodicSeamTests(unittest.TestCase):
             distance = BRepExtrema_DistShapeShape(vertex, seams[0].wrapped)
             self.assertTrue(distance.IsDone())
             self.assertGreaterEqual(distance.Value(), record['seam_clearance_mm'] * (1 - 1e-9))
+        # A source edge keeps its own tolerance (a stored fit's saved fit tolerance widens it); the seam is exact.
+        limit = c.tolerance if edge_limit is None else edge_limit
         self.assertTrue(all(BRep_Tool.Tolerance_s(e.wrapped) <= math.nextafter(c.tolerance, math.inf)
+                            for e in seams))
+        self.assertTrue(all(BRep_Tool.Tolerance_s(e.wrapped) <= math.nextafter(limit, math.inf)
                             for e in face.Edges()))
         if normal_at is not None:
             location, radial = normal_at
@@ -174,6 +200,26 @@ class PeriodicSeamTests(unittest.TestCase):
             normal = face.normalAt(Vector(*location))
             self.assertGreater(radial_sign * (normal.x * radial[0] + normal.y * radial[1] + normal.z * radial[2]), .5)
 
+    @staticmethod
+    def periodic_inputs(model):
+        """What ``_cone_face`` hands to the seam code for a face with more than two loops."""
+        c = a.CadQueryConverter(model)
+        face, placement = model.entities[0], _Placement(None, 1.)
+        surface = c._resolve_geometry(face.surface)
+        loops = c._linked_entities(face.loop, a.LoopEntity, 'next_loop', context='test')
+        geometry = c._cone_geometry(face, surface, placement)
+        return c, face, placement, loops, geometry, c._cone_wires(face, surface, loops, placement, geometry)
+
+    def assert_refused(self, model, reason):
+        c = a.CadQueryConverter(model)
+        with self.assertRaises(a.CadQueryConversionError) as caught:
+            c._face(model.entities[0], _Placement(None, 1.))
+        self.assertEqual(caught.exception.code, 'geometry.face_invalid')
+        self.assertEqual(c.periodic_seam_faces, [])
+        self.assertTrue(any(reason in r['reason'] for r in c.periodic_seam_refusals), c.periodic_seam_refusals)
+
+
+class PeriodicSeamTests(SeamChecks):
     def test_two_loop_cylinder_bounded_by_exact_intersection_curves(self):
         radius = 2.
         m = FaceModel(cylinder_surface(radius))
@@ -233,14 +279,6 @@ class PeriodicSeamTests(unittest.TestCase):
                                        radial_sign=-1. if reversed_face else 1.,
                                        normal_at=((-radius, 0., 1.), (-1., 0., 0.)))
 
-    def assert_refused(self, model, reason):
-        c = a.CadQueryConverter(model)
-        with self.assertRaises(a.CadQueryConversionError) as caught:
-            c._face(model.entities[0], _Placement(None, 1.))
-        self.assertEqual(caught.exception.code, 'geometry.face_invalid')
-        self.assertEqual(c.periodic_seam_faces, [])
-        self.assertTrue(any(reason in r['reason'] for r in c.periodic_seam_refusals), c.periodic_seam_refusals)
-
     def test_no_seam_parameter_clear_of_every_hole_fails_closed(self):
         radius = 2.
         m = FaceModel(cylinder_surface(radius))
@@ -265,6 +303,246 @@ class PeriodicSeamTests(unittest.TestCase):
         full_rim(m, 6., radius, True)
         window(m, lambda z: radius, 1., 2., 2., 4., hole_sense=False)
         self.assert_refused(m.model(), 'hole')
+
+
+class ConeSenseTests(SeamChecks):
+    """The chart sense of the seamed cone face: cos < 0 cones and reversed faces (the f9aa9dd rule)."""
+
+    def test_cone_senses_cos_positive_reversed_and_cos_negative_forward_and_reversed(self):
+        # ACIS cone sense: away from the axis for cos > 0, toward it for cos < 0; a reversed face turns it.
+        for cos, reversed_face in ((.8, True), (-.8, False), (-.8, True)):
+            with self.subTest(cos=cos, reversed_face=reversed_face):
+                sign = (1. if cos > 0 else -1.) * (-1. if reversed_face else 1.)
+                slope = .75 * (1. if cos > 0 else -1.)  # radius = 4 + slope * z
+
+                def radius_at(z):
+                    return 4. + slope * z
+
+                def strip(du, z1, z2):
+                    return du * (radius_at(z1) + radius_at(z2)) / 2 * (z2 - z1) / .8
+
+                m = FaceModel(cone_surface() if cos > 0 else replace(cone_surface(), cos_half_angle=cos))
+                full_rim(m, 0., 4., False)
+                full_rim(m, 4., radius_at(4.), True)
+                window(m, radius_at, -.4, .6, 1., 2.)  # crosses u = 0, where the rims have their vertices
+                window(m, radius_at, 2., 3., 2.5, 3.2)
+                if reversed_face:
+                    reversed_loops(m)
+                model = m.model(reversed_face)
+                c, face = self.convert(model)
+                area = math.pi * (radius_at(0.) + radius_at(4.)) * 5. - strip(1., 1., 2.) - strip(1., 2.5, 3.2)
+                outward = (-.8, 0., -.6 if cos > 0 else .6)  # the cone's outward normal at u = pi
+                self.assert_qualified_seam(c, model, face, area, 2, radial_sign=sign,
+                                           normal_at=((-radius_at(3.6), 0., 3.6), outward))
+
+
+def stored_fit_model(reversed_face):
+    """A 2-loop cylinder band whose rims are stored fits (two edges each on one fit curve)."""
+    radius = 2.
+    m = FaceModel(cylinder_surface(radius))
+    for z, reverse in ((0., False), (4., True)):
+        fit = m.stored_fit_circle(z, radius)
+        v0, v1 = m.vertex(radius, 0, z), m.vertex(-radius, 0, z)
+        first, second = (fit, v0, 0., v1, math.pi, reverse), (fit, v1, math.pi, v0, 2 * math.pi, reverse)
+        m.loop([second, first] if reverse else [first, second])
+    if reversed_face:
+        reversed_loops(m)
+    return m.model(reversed_face)
+
+
+class StoredFitSeamTests(SeamChecks):
+    """A face bounded by stored fits: the deferred seam runs after the heal, in the face sense (F7 face $54)."""
+
+    def convert_with_heal_spy(self, model):
+        """Convert with the heal left to run unchanged but its outcome withheld: it leaves the face invalid."""
+        c = a.CadQueryConverter(model)
+        calls = []
+
+        def heal(face, result):
+            calls.append(dict(deferred=face.index in c._deferred_periodic_seams, valid=result.isValid(),
+                              seams=len(c.periodic_seam_faces)))
+            return result
+
+        with mock.patch.object(c, '_heal_approximated_face', side_effect=heal):
+            face = c._face(model.entities[0], _Placement(None, 1.))
+        return c, face, calls
+
+    def test_stored_fit_band_is_deferred_healed_first_and_seamed_in_both_senses(self):
+        from OCP.BRep import BRep_Tool
+        for reversed_face in (False, True):
+            with self.subTest(reversed_face=reversed_face):
+                model = stored_fit_model(reversed_face)
+                c, face, calls = self.convert_with_heal_spy(model)
+                self.assertEqual({x["subtype"] for x in c.approximations}, {'int_int_cur'})
+                self.assertEqual(c.periodic_seam_refusals, [])
+                # The heal ran first, once, on the still invalid face, with the seam waiting; no seam existed yet.
+                self.assertEqual(calls, [dict(deferred=True, valid=False, seams=0)])
+                self.assertEqual(c._deferred_periodic_seams, {})
+                self.assertTrue(c.periodic_seam_faces[-1]['after_heal'])
+                # The band's own area (2 pi r h, exact: the fits keep z constant) and the face sense.
+                self.assert_qualified_seam(c, model, face, 2 * math.pi * 2. * 4., 0,
+                                           radial_sign=-1. if reversed_face else 1.,
+                                           normal_at=((0., 2., 2.), (0., 1., 0.)),
+                                           edge_limit=c.tolerance + 2e-3 + 1e-9)  # + 2 x the saved fit tolerance
+                # Left to the heal (not withheld), this synthetic band is repaired by it and takes no new seam.
+                healed = a.CadQueryConverter(model)
+                self.assertTrue(healed._face(model.entities[0], _Placement(None, 1.)).isValid())
+                self.assertEqual((len(healed.approximated_face_repairs), healed.periodic_seam_faces), (1, []))
+                # Every source curve, trim interval and orientation kept: 4 source edges on stored fits.
+                self.assertEqual(c.periodic_seam_faces[-1]['source_edges'], 4)
+                pieces = [e for e in face.Edges() if not BRep_Tool.IsClosed_s(e.wrapped, face.wrapped)]
+                curves = []
+                for e in pieces:
+                    curve = BRep_Tool.Curve_s(e.wrapped, 0., 0.)
+                    if not any(curve == known for known in curves):
+                        curves.append(curve)
+                self.assertEqual(len(curves), 4)  # one stored-fit curve handle per source edge, none replaced
+                length = 0.
+                for e in pieces:
+                    first, last = BRep_Tool.Range_s(e.wrapped)
+                    length += last - first
+                self.assertAlmostEqual(length, 2 * 2 * math.pi, places=9)
+                senses = {z: {e.wrapped.Orientation() for e in pieces if round(e.Center().z, 6) == z} for z in (0., 4.)}
+                self.assertTrue(all(len(s) == 1 for s in senses.values()), senses)
+                self.assertNotEqual(senses[0.], senses[4.])
+
+    def test_stored_fit_seam_refusals_leave_the_heal_result_and_fail_closed(self):
+        model = stored_fit_model(False)
+        c = a.CadQueryConverter(model)
+        with mock.patch.object(c, '_heal_approximated_face', side_effect=lambda face, result: result):
+            with mock.patch('cq_acis._analytic_seams._check_periodic_seam', side_effect=ValueError('forced')):
+                with self.assertRaises(a.CadQueryConversionError) as caught:
+                    c._face(model.entities[0], _Placement(None, 1.))
+        self.assertEqual(caught.exception.code, 'geometry.face_invalid')
+        self.assertEqual(c.periodic_seam_faces, [])
+        self.assertTrue(any(r['after_heal'] and 'forced' in r['reason'] for r in c.periodic_seam_refusals))
+
+
+class FailClosedErrorTests(SeamChecks):
+    """OCC and conversion errors inside the seam code refuse the seam path: geometry.face_invalid (M1, M2)."""
+
+    def band_with_hole(self):
+        radius = 2.
+        m = FaceModel(cylinder_surface(radius))
+        full_rim(m, 0., radius, False)
+        full_rim(m, 6., radius, True)
+        window(m, lambda z: radius, 1., 2., 2., 4.)
+        return m.model()
+
+    def injected(self):
+        from OCP.Standard import Standard_Failure
+        from cq_acis.cadquery import CadQueryConversionError
+        return [('_uv_curve', Standard_Failure('injected interpolation failure')),
+                ('_settle_seam', Standard_Failure('injected compose failure')),
+                ('_check_periodic_seam', CadQueryConversionError('injected deviation failure',
+                                                                 code='geometry.supported_curve_mismatch'))]
+
+    def test_occ_and_conversion_errors_in_the_seam_code_are_a_face_invalid_refusal(self):
+        for name, error in self.injected():
+            with self.subTest(name=name):
+                model = self.band_with_hole()
+                c = a.CadQueryConverter(model)
+                with mock.patch(f'cq_acis._analytic_seams.{name}', side_effect=error):
+                    with self.assertRaises(a.CadQueryConversionError) as caught:
+                        c._face(model.entities[0], _Placement(None, 1.))
+                self.assertEqual(caught.exception.code, 'geometry.face_invalid', str(caught.exception))
+                self.assertEqual(c.periodic_seam_faces, [])
+                self.assertTrue(any('injected' in r['reason'] for r in c.periodic_seam_refusals), c.periodic_seam_refusals)
+
+    def test_stored_fit_deferred_seam_errors_are_a_face_invalid_refusal(self):
+        for name, error in self.injected():
+            with self.subTest(name=name):
+                model = stored_fit_model(False)
+                c = a.CadQueryConverter(model)
+                with mock.patch.object(c, '_heal_approximated_face', side_effect=lambda face, result: result), \
+                        mock.patch(f'cq_acis._analytic_seams.{name}', side_effect=error):
+                    with self.assertRaises(a.CadQueryConversionError) as caught:
+                        c._face(model.entities[0], _Placement(None, 1.))
+                self.assertEqual(caught.exception.code, 'geometry.face_invalid', str(caught.exception))
+                self.assertTrue(any(r['after_heal'] and 'injected' in r['reason'] for r in c.periodic_seam_refusals),
+                                c.periodic_seam_refusals)
+
+    @staticmethod
+    def brep_text(wire):
+        from OCP.BRepTools import BRepTools
+        handle, path = tempfile.mkstemp(suffix='.brep')
+        os.close(handle)
+        try:
+            assert BRepTools.Write_s(wire.wrapped, path)
+            with open(path, 'rb') as stream:
+                return stream.read()
+        finally:
+            os.remove(path)
+
+    def test_the_callers_wires_are_not_mutated_by_a_refusal_or_by_the_seam(self):
+        from cq_acis import _analytic_seams as seams
+        for forced in (True, False):
+            with self.subTest(forced_late_refusal=forced):
+                c, face, placement, loops, geometry, wires = self.periodic_inputs(self.band_with_hole())
+                before = [self.brep_text(w) for w in wires]
+                if forced:
+                    with mock.patch.object(seams, '_check_periodic_seam', side_effect=ValueError('forced late')):
+                        self.assertIsNone(seams.periodic_seam_face(c, face, loops, wires, geometry, placement))
+                    self.assertTrue(any('forced late' in r['reason'] for r in c.periodic_seam_refusals))
+                else:
+                    self.assertIsNotNone(seams.periodic_seam_face(c, face, loops, wires, geometry, placement))
+                self.assertEqual(before, [self.brep_text(w) for w in wires])
+
+
+class FailClosedBranchTests(SeamChecks):
+    """Refusals of the seam code that no other test reaches (M4)."""
+
+    def band_with_hole(self, u1=1., u2=2.):
+        radius = 2.
+        m = FaceModel(cylinder_surface(radius))
+        full_rim(m, 0., radius, False)
+        full_rim(m, 6., radius, True)
+        window(m, lambda z: radius, u1, u2, 2., 4.)
+        return m.model()
+
+    def test_mirrored_placement_fails_closed(self):
+        from cq_acis import _analytic_seams as seams
+        c, face, placement, loops, geometry, wires = self.periodic_inputs(self.band_with_hole())
+        with mock.patch.object(_Placement, 'orientation_sign', new=-1.):
+            self.assertIsNone(seams.periodic_seam_face(c, face, loops, wires, geometry, placement))
+        self.assertEqual(c.periodic_seam_faces, [])
+        self.assertTrue(any('mirrored placement' in r['reason'] for r in c.periodic_seam_refusals),
+                        c.periodic_seam_refusals)
+
+    def test_a_hole_crossing_the_seam_parameter_fails_closed(self):
+        model = self.band_with_hole()
+        with mock.patch('cq_acis._analytic_seams._free_parameter', return_value=1.5):  # inside the hole's u-span
+            self.assert_refused(model, 'hole crosses the seam parameter')
+
+    def test_uv_curve_over_the_edge_tolerance_is_refused(self):
+        from OCP.Geom import Geom_Circle, Geom_CylindricalSurface
+        from OCP.gp import gp_Ax2, gp_Ax3, gp_Dir, gp_Pnt
+        from cq_acis import _analytic_seams as seams
+        surface = Geom_CylindricalSurface(gp_Ax3(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1), gp_Dir(1, 0, 0)), 2.)
+        chart = seams._Chart(surface)
+        on = Geom_Circle(gp_Ax2(gp_Pnt(0, 0, 1), gp_Dir(0, 0, 1), gp_Dir(1, 0, 0)), 2.)
+        off = Geom_Circle(gp_Ax2(gp_Pnt(0, 0, 1), gp_Dir(0, 0, 1), gp_Dir(1, 0, 0)), 2.01)
+        pcurve, _, distance, kind = seams._uv_curve(on, 0., 2 * math.pi, chart, surface, 1e-6)
+        self.assertLessEqual(distance, 1e-6)
+        with self.assertRaises(seams._Refusal) as caught:
+            seams._uv_curve(off, 0., 2 * math.pi, chart, surface, 1e-6)  # 0.01 off the support
+        self.assertIn('exceeds the edge tolerance', str(caught.exception))
+
+    def test_a_point_at_or_beyond_the_cone_apex_is_refused(self):
+        from OCP.Geom import Geom_ConicalSurface
+        from OCP.gp import gp_Ax3, gp_Dir, gp_Pnt
+        from cq_acis import _analytic_seams as seams
+        semi = math.atan2(.6, .8)
+        surface = Geom_ConicalSurface(gp_Ax3(gp_Pnt(0, 0, 0), gp_Dir(0, 0, 1), gp_Dir(1, 0, 0)), semi, 4.)
+        chart = seams._Chart(surface)
+        apex_z = -4. / .6 * .8  # radius 4 + v * .6 = 0 at v = -4 / .6, z = v * cos
+        u, v = chart.inverse(gp_Pnt(4., 0., 0.))  # a regular point still maps
+        self.assertAlmostEqual(v, 0.)
+        for z in (apex_z, apex_z - 1.):
+            with self.subTest(z=z):
+                with self.assertRaises(seams._Refusal) as caught:
+                    chart.inverse(gp_Pnt(0., 0., z))
+                self.assertIn('apex', str(caught.exception))
 
 
 if __name__ == '__main__':
