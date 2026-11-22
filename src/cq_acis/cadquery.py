@@ -276,6 +276,8 @@ class CadQueryConverter:
         self.degenerate_edges: list[dict] = []
         self.analytic_trim_faces: list[dict] = []
         self.periodic_seam_faces: list[dict] = []
+        self.periodic_seam_refusals: list[dict] = []
+        self._deferred_periodic_seams: dict[int, dict] = {}
         self.cylinder_slit_faces: list[dict] = []
         self.shell_closure_checks: list[dict] = []
         self.tolerant_endpoints: list[dict] = []
@@ -1745,7 +1747,7 @@ class CadQueryConverter:
             if not builder.IsDone():
                 raise ValueError(f"OCP face builder error {builder.Error()}")
             result = self.cq.Face(builder.Face())
-            if not result.isValid() and surface.is_cylinder() and surface.is_circular():
+            if not result.isValid() and surface.is_circular():
                 from ._analytic_seams import cylinder_seam_face
                 repaired = cylinder_seam_face(self, face, loops, wires, geometry, result, placement,
                                               elliptic_sections=oblique_sections)
@@ -2266,6 +2268,12 @@ class CadQueryConverter:
             result = self._closed_analytic_face(face, surface, loops, placement)
         if not result.isValid() and self._face_uses_approximation(surface, loops):
             result = self._heal_approximated_face(face, result)
+        deferred = self._deferred_periodic_seams.pop(face.index, None)
+        if deferred is not None and not result.isValid():
+            # A face bounded by stored fits is offered to the heal above first, unchanged; only a face it
+            # leaves invalid gets the qualified periodic chart seam (dwg2glb).
+            from ._analytic_seams import periodic_seam_after_heal
+            result = periodic_seam_after_heal(self, face, deferred, result)
         if not result.isValid():
             raise CadQueryConversionError(f"face ${face.index}: face is invalid", code="geometry.face_invalid")
         return result
