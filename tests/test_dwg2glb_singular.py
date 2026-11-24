@@ -434,6 +434,27 @@ class CollapsedRowFaces(unittest.TestCase):
                 reason = self.assert_refused(model)
             self.assertIn("Standard_Failure", reason["reason"])
 
+    def test_refusal_rolls_back_every_public_record(self):
+        """R206 (review M3): lists, the reported dicts and the pcurve scalars come back; only private caches stay."""
+        import cq_acis._singular_rows as rows_module
+        model, _ = patch_model()
+        converter = CadQueryConverter(model)
+        converter.subtype_failures[1] = "kept"
+        converter.approximation_failures[2] = "kept"
+        snapshot = rows_module._snapshot(converter)
+        converter.subtype_failures[1] = "changed"
+        converter.subtype_failures[3] = "added"
+        converter.approximation_failures.clear()
+        converter.pcurve_checks.append({"added": True})
+        converter.pcurve_count += 5
+        converter._geometry_cache["private"] = "stays"
+        rows_module._restore(converter, snapshot, 7, True)
+        self.assertEqual(converter.subtype_failures, {1: "kept"})
+        self.assertEqual(converter.approximation_failures, {2: "kept"})
+        self.assertEqual(converter.pcurve_checks, [])
+        self.assertEqual(converter.pcurve_count, 0)
+        self.assertEqual(converter._geometry_cache["private"], "stays")
+
 
 @unittest.skipUnless(OCP_AVAILABLE, "needs OCP")
 class CollapsedBand(unittest.TestCase):

@@ -141,14 +141,32 @@ def fixture_faces(partner_tolerance=None, top_angles=TOP_ANGLES, with_bottom=Tru
     return faces
 
 
-def healing_face(c, faces):
-    """The `_face` replacement: the band goes through the converter's own M4 heal, the disks are returned as built."""
+def healing_face(c, faces, vertex_tolerance=None):
+    """The `_face` replacement: the band goes through the converter's own M4 heal, the disks are returned as built.
+
+    With `vertex_tolerance`, the tolerance of the healed band's top seam vertex is then set to exactly that value."""
     def face(entity, placement):
         shape = c.cq.Face(faces[entity.index])
         if entity.index == SIDE:
-            return c._heal_approximated_face(entity, shape)
+            healed = c._heal_approximated_face(entity, shape)
+            if vertex_tolerance is not None:
+                set_vertex_tolerance(top_seam_vertex(healed.wrapped), vertex_tolerance)
+            return healed
         return shape
     return face
+
+
+def top_seam_vertex(face):
+    from cq_acis import _seam_junctions as J
+    from OCP.BRep import BRep_Tool
+    return next(v for v in J._seam_vertices(face) if BRep_Tool.Pnt_s(v).Z() > HEIGHT / 2)
+
+
+def set_vertex_tolerance(vertex, tolerance):
+    """Enforce (also lower) the tolerance of a shared vertex."""
+    from OCP.ShapeFix import ShapeFix_ShapeTolerance
+    from OCP.TopAbs import TopAbs_VERTEX
+    ShapeFix_ShapeTolerance().SetTolerance(vertex, tolerance, TopAbs_VERTEX)
 
 
 def convert_shell(faces, model=None):
@@ -158,9 +176,9 @@ def convert_shell(faces, model=None):
         return c, model, c._shell(model.entities[SHELL], PLACEMENT)
 
 
-def built_faces(c, model, faces):
+def built_faces(c, model, faces, vertex_tolerance=None):
     """What `_shell` hands to the fallback: the converter's faces in shell order (the band healed by `c`)."""
-    face = healing_face(c, faces)
+    face = healing_face(c, faces, vertex_tolerance)
     entities = [e for e in model.entities if isinstance(e, FaceEntity)]
     return entities, [face(e, PLACEMENT) for e in entities]
 
@@ -253,6 +271,10 @@ class SeamJunctionTests(unittest.TestCase):
                 self.assertEqual((split["shell"], split["face"], split["partner_face"]), (SHELL, SIDE, TOP))
                 self.assertEqual(split["method"], "partner edge split at the FixMissingSeam seam vertex")
                 self.assertTrue(1e-6 < math.dist(split["point"], (RADIUS, 0.0, HEIGHT)) <= 2 * DV)
+                # R206: the 4B70-like case (gap above the 1e-6 sewing tolerance, inside the seam vertex's own
+                # tolerance) is accepted, and the split lists the gap and the tolerances it was judged against.
+                self.assertTrue(1e-6 < split["gap_mm"] <= split["vertex_tolerance_mm"] < 1e-4)
+                self.assertEqual(split["partner_edge_tolerance_mm"], EDGE_TOL if tolerance is None else tolerance)
                 self.assertAlmostEqual(split["parameter"] % (2 * math.pi), 0.0, delta=1e-9)
                 # One closure record, from the accepted shell only.
                 self.assertEqual(len(c.shell_closure_checks), 1)
@@ -286,16 +308,16 @@ class SeamJunctionTests(unittest.TestCase):
         spy.assert_not_called()
         self.assertIs(caught.exception, forced)
 
-    def refused_like_today(self, faces, reason, model=None):
+    def refused_like_today(self, faces, reason, model=None, vertex_tolerance=None):
         """The fallback refuses: today's error (code and message), state and no split; the refusal is recorded."""
         model = model or shell_model(len(faces))
         today = CadQueryConverter(model)
         with mock.patch(SPLIT, return_value=None), \
-                mock.patch.object(today, "_face", side_effect=healing_face(today, faces)):
+                mock.patch.object(today, "_face", side_effect=healing_face(today, faces, vertex_tolerance)):
             with self.assertRaises(CadQueryConversionError) as expected:
                 today._shell(model.entities[SHELL], PLACEMENT)
         c = CadQueryConverter(model)
-        with mock.patch.object(c, "_face", side_effect=healing_face(c, faces)):
+        with mock.patch.object(c, "_face", side_effect=healing_face(c, faces, vertex_tolerance)):
             with self.assertRaises(CadQueryConversionError) as caught:
                 c._shell(model.entities[SHELL], PLACEMENT)
         self.assertEqual(caught.exception.code, "geometry.shell_open")
@@ -313,8 +335,12 @@ class SeamJunctionTests(unittest.TestCase):
         self.refused_like_today(fixture_faces(with_bottom=False), "not closed")
 
     def test_partner_rim_off_the_band_returns_todays_refusal(self):
-        """A partner whose rim is 1e-4 above the band's (inside its 0.0201 tolerance): split, still not sewn."""
-        self.refused_like_today(fixture_faces(PARTNER_TOL, top_z=HEIGHT + 1e-4), "not closed")
+        """A partner whose rim is 1e-4 above the band's (inside its 0.0201 tolerance): split, still not sewn.
+
+        R206: the seam vertex's tolerance is set to 2e-4 (the gap is 9.5e-5) so that the vertex-tolerance bound lets
+        the split through, as the partner edge's 0.0201 did before; this test is about the later sewing refusing it.
+        The bound's own refusal is `test_gap_beyond_the_vertex_tolerance_but_inside_the_edge_tolerance_is_refused`."""
+        self.refused_like_today(fixture_faces(PARTNER_TOL, top_z=HEIGHT + 1e-4), "not closed", vertex_tolerance=2e-4)
 
     def test_open_shell_without_a_seam_heal_refused(self):
         faces = fixture_faces()
@@ -338,12 +364,12 @@ class SeamJunctionTests(unittest.TestCase):
         with mock.patch("cq_acis._seam_junctions._split_face", side_effect=Standard_Failure("injected")):
             self.refused_like_today(fixture_faces(), "Standard_Failure")
 
-    def direct(self, faces, change=None):
+    def direct(self, faces, change=None, vertex_tolerance=None):
         """Call the fallback directly on the converter's faces (optionally changed), as `_shell` would."""
         from cq_acis._seam_junctions import split_seam_junctions
         model = shell_model(len(faces))
         c = CadQueryConverter(model)
-        entities, built = built_faces(c, model, faces)
+        entities, built = built_faces(c, model, faces, vertex_tolerance)
         if change is not None:
             entities, built = change(c, entities, built)
         before = list(c.shell_closure_checks)
@@ -369,6 +395,126 @@ class SeamJunctionTests(unittest.TestCase):
         self.assertEqual(c.shell_closure_checks, before)
         self.assertEqual(c.seam_junction_splits, [])
         self.assertIn("volume", c.seam_junction_refusals[0]["reason"])
+
+    # --- R206: the split-point bound is the seam vertex's own tolerance
+
+    def accepted_split_gap(self):
+        """The unmodified fixture's split: the distance of the seam vertex to the partner rim circle."""
+        c, result, _ = self.direct(fixture_faces(PARTNER_TOL))
+        self.assertIsNotNone(result)
+        (split,) = c.seam_junction_splits
+        x, y, z = split["point"]
+        return math.hypot(math.hypot(x, y) - RADIUS, z - HEIGHT)
+
+    def test_gap_beyond_the_vertex_tolerance_but_inside_the_edge_tolerance_is_refused(self):
+        """The partner edge's tolerance (0.0201, as 4B70 $33) must not widen the bound: the vertex's own decides."""
+        gap = self.accepted_split_gap()
+        tolerance = gap / 2  # beyond the vertex's tolerance, far inside the partner edge's 0.0201
+        self.assertTrue(1e-6 < tolerance < gap < PARTNER_TOL)
+        c, result, before = self.direct(fixture_faces(PARTNER_TOL), vertex_tolerance=tolerance)
+        self.assertIsNone(result)
+        self.assertEqual(c.shell_closure_checks, before)
+        self.assertEqual(c.seam_junction_splits, [])
+        (refusal,) = c.seam_junction_refusals
+        self.assertEqual(refusal["shell"], SHELL)
+        self.assertEqual(refusal["reason"], f"seam split refused: gap {refusal['gap_mm']:.6g} mm > "
+                                            f"vertex tolerance {tolerance:.6g} mm")
+        self.assertEqual((refusal["face"], refusal["partner_face"]), (SIDE, TOP))
+        self.assertAlmostEqual(refusal["gap_mm"], gap, delta=1e-12)
+        self.assertEqual(refusal["vertex_tolerance_mm"], tolerance)
+        self.assertEqual(refusal["bound"], "seam vertex tolerance")
+
+    def test_the_bound_is_the_vertex_tolerance_exactly(self):
+        gap = self.accepted_split_gap()
+        for factor, accepted in ((1.001, True), (0.999, False)):
+            with self.subTest(factor=factor):
+                c, result, _ = self.direct(fixture_faces(PARTNER_TOL), vertex_tolerance=gap * factor)
+                self.assertEqual(result is not None, accepted)
+                self.assertEqual(len(c.seam_junction_splits), int(accepted))
+                self.assertEqual(len(c.seam_junction_refusals), int(not accepted))
+
+    def test_bound_refusal_returns_todays_refusal_and_is_recorded(self):
+        """Through `_shell`: today's shell_open error unchanged, and the bound refusal is the recorded fact."""
+        gap = self.accepted_split_gap()
+        c = self.refused_like_today(fixture_faces(PARTNER_TOL), "seam split refused: gap", vertex_tolerance=gap / 2)
+        self.assertIn("> vertex tolerance", c.seam_junction_refusals[0]["reason"])
+
+    # --- M2: fail-closed branches reached directly
+
+    def split_inputs(self):
+        """(converter, built faces, [(partner edge, parameter)]) of the fixture's one split."""
+        from cq_acis import _seam_junctions as J
+        faces = fixture_faces(PARTNER_TOL)
+        model = shell_model(len(faces))
+        c = CadQueryConverter(model)
+        _, built = built_faces(c, model, faces)
+        (hit,) = [h for v in J._seam_vertices(built[0].wrapped) for h in J._partner_hits(built, 0, v)]
+        return c, built, hit
+
+    def test_located_face_refused(self):
+        from OCP.gp import gp_Trsf, gp_Vec
+        from OCP.TopLoc import TopLoc_Location
+        def move_top(c, entities, built):
+            shift = gp_Trsf()
+            built = list(built)
+            shift.SetTranslation(gp_Vec(1, 0, 0))
+            built[1] = c.cq.Face(built[1].wrapped.Moved(TopLoc_Location(shift)))
+            return entities, built
+        c, result, before = self.direct(fixture_faces(PARTNER_TOL), move_top)
+        self.assertIsNone(result)
+        self.assertEqual(c.shell_closure_checks, before)
+        self.assertEqual(c.seam_junction_refusals[0]["reason"], "a face of the shell is located")
+
+    def test_two_seam_vertices_in_one_edge_refused(self):
+        from cq_acis import _seam_junctions as J
+        def same_edge(built, k, vertex):
+            return [(1, J._edges(built[1].wrapped)[0], 0.3, 0.0)]
+        with mock.patch.object(J, "_partner_hits", side_effect=same_edge):
+            c, result, before = self.direct(fixture_faces(PARTNER_TOL))
+        self.assertIsNone(result)
+        self.assertEqual(c.seam_junction_splits, [])
+        self.assertIn("two seam vertices inside one edge", c.seam_junction_refusals[0]["reason"])
+
+    def test_located_partner_edge_refused(self):
+        from cq_acis import _seam_junctions as J
+        from OCP.gp import gp_Trsf, gp_Vec
+        from OCP.TopLoc import TopLoc_Location
+        c, built, (j, edge, parameter, *_) = self.split_inputs()
+        shift = gp_Trsf()
+        shift.SetTranslation(gp_Vec(1, 0, 0))
+        with self.assertRaisesRegex(J._Refused, "partner edge is located"):
+            J._split_face(c, built[j], [(edge.Moved(TopLoc_Location(shift)), parameter)])
+
+    def test_partner_edge_without_same_parameter_refused(self):
+        from cq_acis import _seam_junctions as J
+        from OCP.BRep import BRep_Builder
+        from OCP.TopoDS import TopoDS
+        c, built, (j, edge, parameter, *_) = self.split_inputs()
+        copy = TopoDS.Edge_s(edge.EmptyCopied())
+        BRep_Builder().SameParameter(copy, False)
+        with self.assertRaisesRegex(J._Refused, "not same-parameter / same-range"):
+            J._split_face(c, built[j], [(copy, parameter)])
+
+    def test_split_face_missing_its_edges_refused(self):
+        from cq_acis import _seam_junctions as J
+        c, built, (j, edge, parameter, *_) = self.split_inputs()
+        with mock.patch.object(J, "_edges", return_value=[]):
+            with self.assertRaisesRegex(J._Refused, "does not carry the split edges"):
+                J._split_face(c, built[j], [(edge, parameter)])
+
+    def test_invalid_split_face_refused(self):
+        from cq_acis import _seam_junctions as J
+        c, built, (j, edge, parameter, *_) = self.split_inputs()
+        with mock.patch.object(type(built[j]), "isValid", return_value=False):
+            with self.assertRaisesRegex(J._Refused, "split partner face is invalid"):
+                J._split_face(c, built[j], [(edge, parameter)])
+
+    def test_split_face_area_mismatch_refused(self):
+        from cq_acis import _seam_junctions as J
+        c, built, (j, edge, parameter, *_) = self.split_inputs()
+        with mock.patch.object(J, "_area", side_effect=[1.0, 1.5]):
+            with self.assertRaisesRegex(J._Refused, "area .* differs from"):
+                J._split_face(c, built[j], [(edge, parameter)])
 
 
 if __name__ == "__main__":

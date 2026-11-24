@@ -11,10 +11,23 @@ both pieces keep the edge's own curve, pcurves, parameterisation (sub-ranges of 
 the new vertex lies on the curve and carries that same edge tolerance. No tolerance is raised, nothing is re-fitted,
 and no ShapeFix / SameParameter call runs.
 
+Split-point bound (R206): a seam vertex is split into a partner edge only when its distance to that edge's curve is at
+most the seam vertex's OWN tolerance (``BRep_Tool.Tolerance`` of that vertex; 9.44e-5 mm on 4B70 against a gap of
+1.008e-6 mm), never the partner edge's (possibly far larger) tolerance. An edge the vertex reaches only through the
+edge's tolerance refuses the whole attempt: "seam split refused: gap G mm > vertex tolerance T mm".
+
+Where the final gate reads it (no new API): ``converter.seam_junction_splits`` (one dict per split: shell, face,
+partner_face, point, parameter, gap_mm, vertex_tolerance_mm, partner_edge_tolerance_mm, method) and
+``converter.seam_junction_refusals`` (one dict per refused attempt: shell, reason, plus face, partner_face, gap_mm,
+vertex_tolerance_mm, bound when the vertex-tolerance bound refused). Both are public lists like
+``approximated_face_repairs``; the census reads them from the converter after ``convert()`` (also after a refused
+conversion, where the refusal is the record of why the shell stayed open).
+
 Fallback only: ``_shell`` calls this solely after the existing path refused the sewn shell with
 ``geometry.shell_open``, so every shell the existing path closes is never touched. Fail closed: the re-sewn shell has
 to pass the existing shell checks (validity, closure, orientation) and have a positive volume; on anything else, or
-any OCC error, the converter's closure records are restored, a refusal is recorded in ``seam_junction_refusals`` and
+any OCC error, the converter's ``shell_closure_checks`` are cut back to their state at the original refusal (the only
+converter state the attempt writes besides the two records), a refusal is recorded in ``seam_junction_refusals`` and
 the caller re-raises today's error unchanged.
 """
 
@@ -31,7 +44,11 @@ AREA_AGREEMENT = 1e-6
 
 
 class _Refused(Exception):
-    """A qualification that does not hold; the reason is recorded."""
+    """A qualification that does not hold; the reason (and any structured facts) is recorded."""
+
+    def __init__(self, reason, **facts):
+        super().__init__(reason)
+        self.facts = facts
 
 
 def split_seam_junctions(converter, shell, faces, built, checks):
@@ -46,7 +63,8 @@ def split_seam_junctions(converter, shell, faces, built, checks):
     except Exception as error:  # _Refused, CadQueryConversionError, OCC Standard_Failure: all refuse
         del converter.shell_closure_checks[failed:]
         reason = str(error) if isinstance(error, _Refused) else f"{type(error).__name__}: {error}"
-        converter.seam_junction_refusals.append({"shell": shell.index, "reason": reason})
+        facts = error.facts if isinstance(error, _Refused) else {}
+        converter.seam_junction_refusals.append({"shell": shell.index, "reason": reason, **facts})
         return None
     accepted = converter.shell_closure_checks[failed:]
     del converter.shell_closure_checks[checks:]  # the refused attempt's records go; the accepted shell's stay
@@ -74,17 +92,24 @@ def _attempt(converter, shell, faces, built):
     for k in positions:
         for vertex in _seam_vertices(built[k].wrapped):
             hits = _partner_hits(built, k, vertex)
+            tolerance = BRep_Tool.Tolerance_s(vertex)
+            for j, edge, parameter, gap in hits:
+                if gap > tolerance:  # reached only through the partner edge's tolerance (R206): refuse
+                    raise _Refused(f"seam split refused: gap {gap:.6g} mm > vertex tolerance {tolerance:.6g} mm",
+                                   face=faces[k].index, partner_face=faces[j].index, gap_mm=gap,
+                                   vertex_tolerance_mm=tolerance, bound="seam vertex tolerance")
             if len(hits) > 1:
                 raise _Refused(f"ambiguous partner edges for a seam vertex of face ${faces[k].index}")
             if not hits:
                 continue  # the seam meets this loop at an existing vertex
-            j, edge, parameter = hits[0]
+            j, edge, parameter, gap = hits[0]
             if any(edge.IsSame(other) for other, _ in splits.get(j, [])):
                 raise _Refused(f"two seam vertices inside one edge of face ${faces[j].index}")
             splits.setdefault(j, []).append((edge, parameter))
             point = BRep_Tool.Pnt_s(vertex)
             records.append({"face": faces[k].index, "partner_face": faces[j].index,
-                            "point": (point.X(), point.Y(), point.Z()), "parameter": parameter})
+                            "point": (point.X(), point.Y(), point.Z()), "parameter": parameter, "gap_mm": gap,
+                            "vertex_tolerance_mm": tolerance, "partner_edge_tolerance_mm": BRep_Tool.Tolerance_s(edge)})
     if not splits:
         raise _Refused("no seam vertex lies inside a partner edge")
     rebuilt = list(built)
@@ -124,7 +149,8 @@ def _seam_vertices(face):
 
 
 def _partner_hits(built, k, vertex):
-    """(face position, edge, curve parameter) for every edge of another face holding ``vertex`` strictly inside."""
+    """(face position, edge, curve parameter, gap) for every edge of another face holding ``vertex`` strictly inside
+    within the wider of the vertex / edge tolerances (the candidates; the caller applies the vertex-tolerance bound)."""
     from OCP.BRep import BRep_Tool
     hits = []
     for j, face in enumerate(built):
@@ -133,15 +159,16 @@ def _partner_hits(built, k, vertex):
         for edge in _edges(face.wrapped):
             if BRep_Tool.Degenerated_s(edge) or BRep_Tool.IsClosed_s(edge, face.wrapped):
                 continue
-            parameter = _interior_parameter(edge, vertex)
-            if parameter is not None:
-                hits.append((j, edge, parameter))
+            found = _interior_parameter(edge, vertex)
+            if found is not None:
+                hits.append((j, edge, *found))
     return hits
 
 
 def _interior_parameter(edge, vertex):
-    """The curve parameter of ``vertex`` on ``edge`` when it lies on the edge (within the existing vertex / edge
-    tolerance) and clear of both end vertices; else None."""
+    """(curve parameter, distance of ``vertex`` to the curve) when ``vertex`` lies on ``edge`` within the wider of the
+    existing vertex / edge tolerances and clear of both end vertices; else None. The split-point bound itself (the
+    vertex's own tolerance) is applied by ``_attempt``, so that a refusal by it can be recorded."""
     from OCP.BRep import BRep_Tool
     from OCP.BRepAdaptor import BRepAdaptor_Curve
     from OCP.GeomAPI import GeomAPI_ProjectPointOnCurve
@@ -162,7 +189,7 @@ def _interior_parameter(edge, vertex):
     parameter = projection.LowerDistanceParameter()
     if not first < parameter < last:
         return None
-    return parameter
+    return parameter, projection.LowerDistance()
 
 
 def _split_face(converter, face, items):

@@ -437,14 +437,24 @@ def _accept(face, joins):
 
 
 def _snapshot(converter):
-    lists = {name: len(value) for name, value in vars(converter).items() if isinstance(value, list)}
-    return lists, converter.pcurve_count, converter.pcurve_max_deviation
+    """What a refused rebuild rolls back: every list attribute (cut to its length), every public dict record
+    (``subtype_failures``, ``approximation_failures``, ...: copied) and the two pcurve scalars. The private caches
+    (``_geometry_cache``, ``_topology_views``, ``_approximation_*``) are NOT rolled back: they only memoise
+    deterministic results, so a stale entry is identical to a fresh one."""
+    attributes = vars(converter).items()
+    lists = {name: len(value) for name, value in attributes if isinstance(value, list)}
+    records = {name: dict(value) for name, value in attributes if isinstance(value, dict) and not name.startswith("_")}
+    return lists, records, converter.pcurve_count, converter.pcurve_max_deviation
 
 
 def _restore(converter, snapshot, face_index, had_deferred):
-    lists, count, deviation = snapshot
+    lists, records, count, deviation = snapshot
     for name, length in lists.items():
         del getattr(converter, name)[length:]
+    for name, copy in records.items():
+        record = getattr(converter, name)
+        record.clear()
+        record.update(copy)
     converter.pcurve_count, converter.pcurve_max_deviation = count, deviation
     if not had_deferred:
         converter._deferred_periodic_seams.pop(face_index, None)
