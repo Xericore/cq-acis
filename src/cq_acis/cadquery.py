@@ -305,6 +305,12 @@ class CadQueryConverter:
         self._approximation_tolerances: dict[int, float] = {}
         self._approximation_closures: dict[int, tuple[int, int]] = {}
         self.subtype_failures: dict[int, str] = {}
+        # dwg2glb (M4b F7): stored-fit faces closed on a collapsed pole row (_singular_rows), and refusals.
+        self.singular_row_faces: list[dict] = []
+        self.singular_row_refusals: list[dict] = []
+        self._row_join_candidates: list[dict] = []
+        self._row_insertions = None
+        self._row_insertion_records: list[dict] = []
         self._extension_native = None
         self._geometry_cache = {}
         self._topology_views = {}
@@ -1333,6 +1339,11 @@ class CadQueryConverter:
                     if (allowance or previous_allowance) and self._singular_segment(
                             surface, previous_end, join, max(previous_limit, limit)):
                         singular.append((i, previous_end, join, surface.Value(*join), max(previous_limit, limit)))
+                    elif allowance or previous_allowance:
+                        # dwg2glb (M4b F7): a gap the singular-point test refused; _singular_rows may close it.
+                        self._row_join_candidates.append(dict(loop=loop_index, position=i,
+                            previous=list(previous_end), join=list(join), limit=max(previous_limit, limit),
+                            previous_coedge=coedges[i-1], coedge=coedge))
                 self.pcurve_max_deviation = max(self.pcurve_max_deviation, check.MaxDistance())
                 self.pcurve_count += 1
                 self.pcurve_checks.append({"loop": loop_index,
@@ -1402,6 +1413,11 @@ class CadQueryConverter:
                         surface, previous_end, closing, max(previous_limit, first_limit)):
                     singular.append((len(edges), previous_end, closing, surface.Value(*closing),
                                      max(previous_limit, first_limit)))
+                elif previous_allowance or first_allowance:
+                    # dwg2glb (M4b F7): see the in-loop join above.
+                    self._row_join_candidates.append(dict(loop=loop_index, position=len(edges),
+                        previous=list(previous_end), join=list(closing), limit=max(previous_limit, first_limit),
+                        previous_coedge=coedges[-1], coedge=coedges[0]))
                 break
         return singular
 
@@ -1525,9 +1541,15 @@ class CadQueryConverter:
         coedges = self._coedges(loop)
         edges = tuple(self._edge(coedge, placement) for coedge in coedges)
         if surface_geometry is not None:
+            mark = len(self._row_join_candidates)
             singular = self._attach_surface_pcurves(
                 edges, surface_geometry, loop_index=loop.index, coedges=coedges, placement=placement
             )
+            if self._row_insertions is not None and loop.index in self._row_insertions:
+                # dwg2glb (M4b F7): only while _singular_rows.close_collapsed_rows rebuilds a qualified face.
+                from ._singular_rows import row_insertion
+                edges = row_insertion(self, loop, edges, surface_geometry.surface,
+                                      self._row_join_candidates[mark:], singular)
             if singular:
                 # A fitted support that runs out to a point leaves a UV gap at
                 # the shared source vertex; OCCT closes it with a degenerated edge.
@@ -2233,6 +2255,7 @@ class CadQueryConverter:
         return self._reverse_face(result) if face.reversed != surface.reversed else result
 
     def _face(self, face: FaceEntity, placement: _Placement):
+        self._row_join_candidates = []
         surface = self._resolve_geometry(face.surface)
         if not isinstance(surface, (PlaneSurfaceEntity, ConeSurfaceEntity, SphereSurfaceEntity, TorusSurfaceEntity, BSplineSurfaceEntity)):
             if surface is None:
@@ -2274,6 +2297,11 @@ class CadQueryConverter:
             # leaves invalid gets the qualified periodic chart seam (dwg2glb).
             from ._analytic_seams import periodic_seam_after_heal
             result = periodic_seam_after_heal(self, face, deferred, result)
+        if (not result.isValid() and isinstance(surface, BSplineSurfaceEntity) and self._row_join_candidates
+                and self._approximation_tolerance(surface)):
+            # dwg2glb (M4b F7): a stored fit collapsing a band of end pole rows; fallback only (_singular_rows).
+            from ._singular_rows import close_collapsed_rows
+            result = close_collapsed_rows(self, face, surface, loops, placement, result)
         if not result.isValid():
             raise CadQueryConversionError(f"face ${face.index}: face is invalid", code="geometry.face_invalid")
         return result
