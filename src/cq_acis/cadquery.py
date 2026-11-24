@@ -311,6 +311,9 @@ class CadQueryConverter:
         self._row_join_candidates: list[dict] = []
         self._row_insertions = None
         self._row_insertion_records: list[dict] = []
+        # dwg2glb (M4b F7, R205): partner edges split at a FixMissingSeam seam vertex (_seam_junctions), and refusals.
+        self.seam_junction_splits: list[dict] = []
+        self.seam_junction_refusals: list[dict] = []
         self._extension_native = None
         self._geometry_cache = {}
         self._topology_views = {}
@@ -2380,15 +2383,30 @@ class CadQueryConverter:
                     f"not ${shell.index}"
                 )
         try:
-            result = self.cq.Shell.makeShell(
-                self._face(face, placement) for face in faces
-            )
+            built = [self._face(face, placement) for face in faces]
+            result = self.cq.Shell.makeShell(built)
         except CadQueryConversionError:
             raise
         except Exception as error:
             raise CadQueryConversionError(
                 f"shell ${shell.index}: CadQuery could not sew the faces"
             ) from error
+        checks = len(self.shell_closure_checks)
+        try:
+            return self._shell_components(result, shell, faces)
+        except CadQueryConversionError as error:
+            if error.code != "geometry.shell_open":
+                raise
+            # dwg2glb (M4b F7, R205): fallback only, after the existing path refused the shell as open; a refusal
+            # (None) re-raises today's error unchanged (_seam_junctions).
+            from ._seam_junctions import split_seam_junctions
+            components = split_seam_junctions(self, shell, faces, built, checks)
+            if components is None:
+                raise
+            return components
+
+    def _shell_components(self, result, shell: ShellEntity, faces) -> tuple[cq.Shell, ...]:
+        """The existing checks of a sewn shell: validity, components, closure and orientation."""
         if not result.isValid():
             raise CadQueryConversionError(f"shell ${shell.index}: shell is invalid")
 
