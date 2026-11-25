@@ -314,6 +314,10 @@ class CadQueryConverter:
         # dwg2glb (M4b F7, R205): partner edges split at a FixMissingSeam seam vertex (_seam_junctions), and refusals.
         self.seam_junction_splits: list[dict] = []
         self.seam_junction_refusals: list[dict] = []
+        # dwg2glb (M4b F5, R202): shells split at a > 2-coedge source edge into body-consistent solids
+        # (_nonmanifold_split), and refusals.
+        self.nonmanifold_splits: list[dict] = []
+        self.nonmanifold_split_refusals: list[dict] = []
         self._extension_native = None
         self._geometry_cache = {}
         self._topology_views = {}
@@ -2384,6 +2388,14 @@ class CadQueryConverter:
                 )
         try:
             built = [self._face(face, placement) for face in faces]
+            # dwg2glb (M4b F5, R202): only a shell with a source edge of more than 2 coedges is split, before
+            # today's sewing; a refusal (None) continues on today's path unchanged (_nonmanifold_split).
+            from ._nonmanifold_split import nonmanifold_rings, split_nonmanifold_shell
+            rings = nonmanifold_rings(self, faces)
+            if rings:
+                components = split_nonmanifold_shell(self, shell, faces, built, rings)
+                if components is not None:
+                    return components
             result = self.cq.Shell.makeShell(built)
         except CadQueryConversionError:
             raise
