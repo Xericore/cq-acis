@@ -7,11 +7,20 @@ the rod, and OCCT certifies a wrong solid (-314,963 mm3).
 
 Here, before today's sewing and only for a shell with a source edge of more than 2 coedges:
 
-* **Partition** (``split_bodies``, combinatorial, no OCC): bodies are the connected face sets over the manifold
-  (2-coedge) source edges plus one pairing of every non-manifold ring. A pairing joins the ring's coedges two by two,
-  each pair of opposite senses (a manifold pair). It is *body-consistent* when the pairs of every ring end up in
-  different bodies. Required: every non-manifold ring has exactly 4 coedges (the parent admits only 4-triangle edges,
-  Task 6b); exactly one pairing is body-consistent (two or more = ambiguous); at least two bodies.
+* **Partition** (``split_bodies``, combinatorial, no OCC; the body rule as ruled in R207, which amends the plan's
+  "manifold (2-coedge) source edges only"): bodies are the connected face sets over the manifold (2-coedge) source
+  edges plus one pairing of every non-manifold ring. A pairing joins the ring's coedges two by two, each pair of
+  opposite senses (a manifold pair). It is *body-consistent* when the pairs of every ring end up in different bodies.
+  Required: every non-manifold ring has exactly 4 coedges (the parent admits only 4-triangle edges, Task 6b; a
+  6-coedge ring, i.e. three bodies on one ring, is refused); exactly one pairing of the product over all rings is
+  body-consistent (two or more = ambiguous, none = refused; at most 64 are tried); at least two bodies.
+  Over a 4-coedge ring the four owners fall into manifold components; exactly two patterns are accepted: (2,2) (two
+  components, two owners each: the pairs are the components) and (1,1,2) (22B8: rod side + rod top + sleeve; one
+  component holds two owners, the other two owners are alone: the only body-consistent pairing joins the two lone
+  owners, because a third ring owner in the two-owner component would make that body non-manifold). A disk that
+  belongs to a third body cannot occur at a 4-coedge ring. Every other pattern (one component, (1,3), four lone
+  owners with two pairings, senses without an opposite pairing) is refused; a joined body that is geometrically wrong
+  is refused by the per-body checks below. Refusal reasons are recorded (``nonmanifold_split_refusals``).
 * **Per body**: the body's faces are sewn on their own, with the same ``BRepBuilderAPI_Sewing()`` call as
   ``makeShell`` (kept here to read ``Modified``). Every body must sew into one valid shell that keeps the as-built
   orientation of every face.
@@ -28,8 +37,9 @@ Here, before today's sewing and only for a shell with a source edge of more than
   itself, a 2D circle's frame turned; any other pcurve refuses; each shift is recorded in ``parameter_shifts``); both
   bodies then use it (``BRepTools_ReShape``), and the second body's loop vertices are the first body's. Nothing is
   re-fitted or approximated, no tolerance is raised (``UpdateEdge`` with the edge's own
-  tolerance; checked afterwards), no ShapeFix / SameParameter call runs. BRepMesh therefore discretises the loop once
-  and the parent welds it into 4-triangle edges (Task 6b).
+  tolerance; refused beforehand when the first body's loop edge or vertex has a larger tolerance than the second
+  body's it replaces, element by element, and checked afterwards per body), no ShapeFix / SameParameter call runs.
+  BRepMesh therefore discretises the loop once and the parent welds it into 4-triangle edges (Task 6b).
 * **Accepted** only if every final shell is valid, closed and oriented (the existing ``_check_shell_closure``), keeps
   the as-built orientation of every face, encloses a finite positive volume as oriented, and ``Solid.makeSolid`` and
   the compound of the solids (what ``_lump`` builds) are valid with the same positive volumes.
@@ -444,6 +454,8 @@ def _share_loop(edge_index, sx, sy, xs, ys, current):
     shifts = []
     for ex, ey, shift in matches:
         tolerance = BRep_Tool.Tolerance_s(ex)
+        if tolerance > BRep_Tool.Tolerance_s(ey):  # per element, not per body maximum: ey would take ex's tolerance
+            raise _Refused(f"edge ${edge_index}: sharing would raise the second body's loop edge tolerance")
         curve = BRepAdaptor_Curve(ex)
         first, last = curve.FirstParameter(), curve.LastParameter()
         shared = copier.Copy(ex, True)
@@ -471,6 +483,8 @@ def _share_loop(edge_index, sx, sy, xs, ys, current):
                        (TopExp.LastVertex_s(ex), TopExp.LastVertex_s(ey))):
             if vy.IsSame(vx) or any(vy.IsSame(done) for done in replaced):
                 continue
+            if BRep_Tool.Tolerance_s(vx) > BRep_Tool.Tolerance_s(vy):  # vy becomes vx
+                raise _Refused(f"edge ${edge_index}: sharing would raise the second body's loop vertex tolerance")
             if BRep_Tool.Pnt_s(vx).Distance(BRep_Tool.Pnt_s(vy)) > BRep_Tool.Tolerance_s(vx):
                 raise _Refused(f"edge ${edge_index}: a loop vertex of the second body lies outside the first "
                                "body's vertex tolerance")

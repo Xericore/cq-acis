@@ -21,6 +21,7 @@ from __future__ import annotations
 import importlib.util
 import math
 import unittest
+from itertools import product
 from types import SimpleNamespace
 from unittest import mock
 
@@ -43,6 +44,10 @@ SLEEVE = (BORE, SLEEVE_BOTTOM, SLEEVE_TOP, OUTER)
 V_ROD = math.pi * R_ROD ** 2 * H_ROD
 V_SLEEVE = math.pi * (R_OUT ** 2 - R_ROD ** 2) * H_SLEEVE
 SPLIT = "cq_acis._nonmanifold_split"
+# Owner patterns the ruled body rule accepts (R207), counted by hand: (2,2): 3 ways to pair the 4 owners x 2 x 2 sense
+# choices that make each pair opposite = 12; (1,1,2): 6 choices of the pair x 2 senses of it x 2 for the lone owners
+# (one runs each way) = 24.
+ACCEPTED_OWNER_PATTERNS = 12 + 24
 
 # Per source face: its loops, each a list of (source edge key, coedge reversed). The ring senses are 22B8's.
 TWO_BODY_LOOPS = {
@@ -348,12 +353,40 @@ def ring_faces(spec):
     return [SimpleNamespace(index=i) for i in indices], spec
 
 
+def set_partitions(items):
+    """Every partition of the list ``items`` into blocks."""
+    if not items:
+        yield []
+        return
+    first, rest = items[0], items[1:]
+    for partition in set_partitions(rest):
+        yield [[first]] + partition
+        for k in range(len(partition)):
+            yield partition[:k] + [[first] + partition[k]] + partition[k + 1:]
+
+
+def manifold_chain(start, faces, senses=(False, True)):
+    """Manifold (2-coedge) source edges joining consecutive ``faces`` into one body: {edge: ring}, next free id."""
+    out, n = {}, start
+    for a, b in zip(faces, faces[1:]):
+        out[f"m{n}"] = [(n, a, senses[0]), (n + 1, b, senses[1])]
+        n += 2
+    return out, n
+
+
 class PartitionTests(unittest.TestCase):
+    """The ruled body rule (R207), CAD-free. Bodies are the connected face sets over the manifold (2-coedge) source
+    edges plus the unique body-consistent pairing of every non-manifold ring (every ring a 4-coedge ring whose pairs
+    land in different bodies). In the 22B8 pattern (two lone owners, one two-owner component) the pairing is forced
+    and joins the two lone owners."""
+
     def split(self, spec):
+        """(bodies as sorted face indices or None, the refusal reasons)."""
         from cq_acis._nonmanifold_split import split_bodies
         faces, rings = ring_faces(spec)
-        bodies = split_bodies(faces, rings)
-        return None if bodies is None else [sorted(f.index for f in body) for body in bodies]
+        reasons = []
+        bodies = split_bodies(faces, rings, reasons)
+        return (None if bodies is None else [sorted(f.index for f in body) for body in bodies]), reasons
 
     def test_22b8_like_ring_has_one_body_consistent_partition(self):
         """The fixture's rings (rod top a body of its own over the manifold edges): exactly one pairing qualifies."""
@@ -362,34 +395,150 @@ class PartitionTests(unittest.TestCase):
             "rod_rim": [(14, 3, False), (15, 5, True)], "bore_rim": [(16, 6, False), (17, 8, True)],
             "outer_low": [(18, 7, False), (19, 9, True)], "outer_high": [(20, 8, True), (21, 9, False)],
         }
-        self.assertEqual(self.split(spec), [[3, 4, 5], [6, 7, 8, 9]])
+        self.assertEqual(self.split(spec), ([[3, 4, 5], [6, 7, 8, 9]], []))
 
     def test_ambiguous_partition_refused(self):
         """Four faces meeting only at one 4-coedge ring, senses alternating: two valid pairings -> refused."""
         spec = {"ring": [(10, 3, True), (11, 4, False), (12, 5, True), (13, 6, False)]}
-        self.assertIsNone(self.split(spec))
+        self.assertEqual(self.split(spec), (None, ["ambiguous partition: 2 pairings"]))
 
     def test_odd_coedge_ring_refused(self):
         spec = {"ring": [(10, 3, True), (11, 4, False), (12, 5, True)],
                 "a": [(14, 3, False), (15, 4, True)]}
-        self.assertIsNone(self.split(spec))
+        self.assertEqual(self.split(spec), (None, ["edge $ring has 3 coedges; only 4-coedge edges are split"]))
 
     def test_same_body_ring_refused(self):
         """All 4 coedges of the ring in one body (the faces are also joined by manifold edges) -> refused."""
         spec = {"ring": [(10, 3, True), (11, 4, False), (12, 5, True), (13, 6, False)],
                 "a": [(14, 3, False), (15, 4, True)], "b": [(16, 4, True), (17, 5, False)],
                 "c": [(18, 5, False), (19, 6, True)]}
-        self.assertIsNone(self.split(spec))
+        self.assertEqual(self.split(spec), (None, ["no body-consistent pairing"]))
 
     def test_same_sense_pairs_refused(self):
         """Two bodies, but each body's two coedges of the ring run the same way: no manifold pair -> refused."""
         spec = {"ring": [(10, 3, True), (11, 4, True), (12, 5, False), (13, 6, False)],
                 "a": [(14, 3, False), (15, 4, True)], "b": [(16, 5, False), (17, 6, True)]}
-        self.assertIsNone(self.split(spec))
+        self.assertEqual(self.split(spec), (None, ["no body-consistent pairing"]))
+
+    def test_ring_without_opposite_senses_refused(self):
+        """No pairing of the ring's coedges into opposite senses exists (all four run the same way, or three/one)."""
+        for senses in ((True,) * 4, (False,) * 4, (True, True, True, False), (True, False, False, False)):
+            with self.subTest(senses=senses):
+                spec = {"ring": [(10 + k, 3 + k, senses[k]) for k in range(4)]}
+                self.assertEqual(self.split(spec),
+                                 (None, ["edge $ring: no pairing of its coedges into opposite senses"]))
 
     def test_manifold_rings_are_not_split(self):
         spec = {"a": [(10, 3, True), (11, 4, False)], "b": [(12, 3, False), (13, 4, True)]}
-        self.assertIsNone(self.split(spec))
+        self.assertEqual(self.split(spec), (None, ["no source edge has more than 2 coedges"]))
+
+    # -------------------------------------------------- the deviation's limits (R207, I2)
+
+    def test_six_coedge_ring_refused(self):
+        """Three two-face bodies on one ring (6 coedges): only 4-coedge edges are split, though exactly one pairing
+        (each body's own two coedges) would be body-consistent."""
+        spec = {"ring": [(10, 3, True), (11, 4, False), (12, 5, True), (13, 6, False), (14, 7, True),
+                         (15, 8, False)],
+                "a": [(20, 3, False), (21, 4, True)], "b": [(22, 5, False), (23, 6, True)],
+                "c": [(24, 7, False), (25, 8, True)]}
+        self.assertEqual(self.split(spec), (None, ["edge $ring has 6 coedges; only 4-coedge edges are split"]))
+
+    def test_a_six_coedge_ring_refuses_the_whole_shell_beside_a_four_coedge_ring(self):
+        spec = {"six": [(10, 3, True), (11, 4, False), (12, 5, True), (13, 6, False), (14, 7, True),
+                        (15, 8, False)],
+                "four": [(16, 3, True), (17, 4, False), (18, 9, True), (19, 10, False)],
+                "a": [(20, 3, False), (21, 4, True)], "b": [(22, 5, False), (23, 6, True)],
+                "c": [(24, 7, False), (25, 8, True)], "d": [(26, 9, False), (27, 10, True)]}
+        self.assertEqual(self.split(spec), (None, ["edge $six has 6 coedges; only 4-coedge edges are split"]))
+
+    def two_rings_on_shared_bodies(self):
+        """Body A (faces 3-6) and body B (faces 7-10) meet at two rings: ring1 on faces 3, 4 / 7, 8, ring2 on faces
+        5, 6 / 9, 10 (a rod through a sleeve touching it twice)."""
+        a, n = manifold_chain(100, [3, 4, 5, 6])
+        b, n = manifold_chain(n, [7, 8, 9, 10])
+        spec = {"ring1": [(10, 3, True), (11, 4, False), (12, 7, True), (13, 8, False)],
+                "ring2": [(14, 5, True), (15, 6, False), (16, 9, True), (17, 10, False)], **a, **b}
+        return spec
+
+    def test_two_rings_unique_product(self):
+        """Two non-manifold rings at once: the product of their pairings has exactly one body-consistent member."""
+        self.assertEqual(self.split(self.two_rings_on_shared_bodies()),
+                         ([[3, 4, 5, 6], [7, 8, 9, 10]], []))
+
+    def test_two_rings_pairings_must_agree(self):
+        """Ring 2 with the faces of its A pair swapped to the other body's neighbours: ring 1 alone is unique but the
+        pair of ring 2 lands inside one body of the other ring's choice -> no consistent member of the product."""
+        spec = self.two_rings_on_shared_bodies()
+        spec["ring2"] = [(14, 5, True), (15, 9, False), (16, 6, True), (17, 10, False)]
+        bodies, reasons = self.split(spec)
+        self.assertIsNone(bodies)
+        self.assertEqual(reasons, ["no body-consistent pairing"])
+
+    def test_two_rings_ambiguous_refused(self):
+        """Two rings, each on four faces meeting only there (senses alternating): 2 x 2 pairings -> ambiguous."""
+        spec = {"r1": [(10, 3, True), (11, 4, False), (12, 5, True), (13, 6, False)],
+                "r2": [(14, 7, True), (15, 8, False), (16, 9, True), (17, 10, False)]}
+        self.assertEqual(self.split(spec), (None, ["ambiguous partition: 4 pairings"]))
+
+    def test_one_ambiguous_ring_spoils_a_unique_one(self):
+        """Ring 1 is the unique 22B8 pattern, ring 2 is ambiguous: 1 x 2 pairings -> ambiguous, refused."""
+        spec = {"r1": [(10, 3, True), (11, 4, False), (12, 5, True), (13, 6, False)],
+                "a": [(20, 3, False), (21, 4, True)], "b": [(22, 5, False), (23, 6, True)],
+                "r2": [(14, 7, True), (15, 8, False), (16, 9, True), (17, 10, False)]}
+        self.assertEqual(self.split(spec), (None, ["ambiguous partition: 2 pairings"]))
+
+    def test_one_unqualified_ring_refuses_a_unique_one(self):
+        """Ring 1 unique, ring 2 with all four coedges in one body: the shell is refused, not half split."""
+        spec = {"r1": [(10, 3, True), (11, 4, False), (12, 5, True), (13, 6, False)],
+                "a": [(20, 3, False), (21, 4, True)], "b": [(22, 5, False), (23, 6, True)],
+                "r2": [(14, 7, True), (15, 8, False), (16, 9, True), (17, 10, False)]}
+        chain, _ = manifold_chain(100, [7, 8, 9, 10])
+        spec.update(chain)
+        self.assertEqual(self.split(spec), (None, ["no body-consistent pairing"]))
+
+    def test_too_many_pairings_refused(self):
+        """Seven ambiguous rings: 2**7 = 128 pairings, more than MAX_PAIRINGS = 64 -> refused before any is tried."""
+        spec = {f"r{r}": [(10 + 4 * r + k, 3 + 4 * r + k, k % 2 == 0) for k in range(4)] for r in range(7)}
+        self.assertEqual(self.split(spec), (None, ["more than 64 pairings to try"]))
+
+    def test_every_owner_pattern_of_a_four_coedge_ring(self):
+        """All 15 ways the ring's 4 owners fall into manifold components x all 16 sense patterns. Accepted (and only
+        these): (2,2) with opposite senses inside each pair; (1,1,2) with opposite senses in the pair, the two lone
+        owners then joined (R207, 22B8). Everything else is refused with its reason."""
+        accepted = refused = 0
+        for blocks in set_partitions([0, 1, 2, 3]):
+            for senses in product((True, False), repeat=4):
+                with self.subTest(blocks=blocks, senses=senses):
+                    spec = {"ring": [(10 + k, 3 + k, senses[k]) for k in range(4)]}
+                    n = 100
+                    for block in blocks:
+                        chain, n = manifold_chain(n, [3 + k for k in block])
+                        spec.update(chain)
+                    shape = sorted(len(block) for block in blocks)
+                    pairs = [block for block in blocks if len(block) == 2]
+                    opposite = all(senses[a] != senses[b] for a, b in pairs)
+                    singles = [block[0] for block in blocks if len(block) == 1]
+                    expected_reason, expected = None, None
+                    if sum(senses) != 2:
+                        expected_reason = "edge $ring: no pairing of its coedges into opposite senses"
+                    elif shape == [2, 2] and opposite:
+                        expected = [[3 + k for k in block] for block in blocks]
+                    elif shape == [1, 1, 2] and opposite:
+                        expected = [[3 + k for k in block] for block in blocks if len(block) == 2]
+                        expected.append([3 + k for k in singles])
+                    elif shape == [1, 1, 1, 1]:
+                        expected_reason = "ambiguous partition: 2 pairings"
+                    else:
+                        expected_reason = "no body-consistent pairing"
+                    bodies, reasons = self.split(spec)
+                    if expected is None:
+                        refused += 1
+                        self.assertEqual((bodies, reasons), (None, [expected_reason]))
+                    else:
+                        accepted += 1
+                        self.assertEqual(sorted(sorted(body) for body in bodies), sorted(sorted(b) for b in expected))
+                        self.assertEqual(reasons, [])
+        self.assertEqual((accepted, refused), (ACCEPTED_OWNER_PATTERNS, 240 - ACCEPTED_OWNER_PATTERNS))
 
 
 # ------------------------------------------------------------------ the converter
@@ -574,10 +723,13 @@ class NonmanifoldSplitTests(unittest.TestCase):
         self.assertEqual(len(outcome[1]), 1)
         self.assertEqual((c.nonmanifold_splits, c.nonmanifold_split_refusals), ([], []))
 
-    def refused_like_today(self, faces, reason, face_loops=TWO_BODY_LOOPS, model=None):
-        """The split is refused with `reason` in its record, and `_shell` ends exactly as today's path."""
-        c, outcome = shell_outcome(face_loops, faces, model)
-        expected, records = todays_path(face_loops, faces)
+    def refused_like_today(self, make_faces, reason, face_loops=TWO_BODY_LOOPS, model=None):
+        """The split is refused with `reason` in its record, and `_shell` ends exactly as today's path.
+
+        ``make_faces()`` builds the fixture faces afresh for the split attempt and again for today's path, so an
+        in-place change of the attempt's faces cannot go unseen."""
+        c, outcome = shell_outcome(face_loops, make_faces(), model)
+        expected, records = todays_path(face_loops, make_faces())
         self.assertEqual(outcome, expected)
         self.assertEqual(c.nonmanifold_splits, [])
         self.assertEqual(len(c.nonmanifold_split_refusals), 1)
@@ -589,21 +741,158 @@ class NonmanifoldSplitTests(unittest.TestCase):
     def test_open_body_after_split_refused(self):
         """The rod without its bottom disk: the partition qualifies, the rod body does not close -> today's path."""
         loops = {face: loops for face, loops in TWO_BODY_LOOPS.items() if face != ROD_BOTTOM}
-        faces = fixture_faces()
-        renumbered_loops, renumbered_faces = {}, {}
-        for new, old in enumerate(sorted(loops), start=3):
-            renumbered_loops[new] = loops[old]
-            renumbered_faces[new] = faces[old]
+        order = sorted(loops)
+
+        def renumbered_faces():
+            faces = fixture_faces()
+            return {new: faces[old] for new, old in enumerate(order, start=3)}
+
+        renumbered_loops = {new: loops[old] for new, old in enumerate(order, start=3)}
         self.refused_like_today(renumbered_faces, "not closed", renumbered_loops)
 
     def test_negative_body_after_split_refused(self):
         """Every sleeve face inverted: the sleeve body sews closed and oriented but encloses a negative volume."""
-        self.refused_like_today(fixture_faces(invert_sleeve=True), "volume")
+        self.refused_like_today(lambda: fixture_faces(invert_sleeve=True), "volume")
 
     def test_occ_error_fails_closed(self):
         from OCP.Standard import Standard_Failure
         with mock.patch(f"{SPLIT}._sew_body", side_effect=Standard_Failure("injected")):
-            self.refused_like_today(fixture_faces(), "Standard_Failure")
+            self.refused_like_today(fixture_faces, "Standard_Failure")
+
+    # -------------------------------------------------- the F5 failure-mode guards driven to refusal (R207, I1)
+
+    def sew_then(self, mutate):
+        """Patch ``_sew_body``: the real sewing, then ``mutate(body number, sewn shell)`` -> the shell handed on."""
+        from cq_acis import _nonmanifold_split as S
+        real = S._sew_body
+        calls = []
+
+        def patched(faces):
+            sewn, mapping = real(faces)
+            body = len(calls)
+            calls.append(body)
+            return mutate(body, sewn), mapping
+        return mock.patch(f"{SPLIT}._sew_body", side_effect=patched)
+
+    def test_sewing_reorients_a_body_refused(self):
+        """Sewing hands on a body whose faces all run the other way (a consistent, closed shell: only the as-built
+        orientation check sees it, the way the F5 quilt re-oriented faces): refused, not volume-fixed."""
+        with self.sew_then(lambda body, sewn: sewn.Reversed()):
+            c, _ = self.refused_like_today(fixture_faces, "as-built orientation")
+        self.assertNotIn("volume", c.nonmanifold_split_refusals[0]["reason"])
+
+    def test_sewing_reorients_one_face_refused(self):
+        """One face of the sleeve body reversed alone: the shell is no longer consistently oriented, refused."""
+        from OCP.BRep import BRep_Builder
+        from OCP.TopAbs import TopAbs_FACE
+        from OCP.TopoDS import TopoDS_Shell
+
+        def reverse_one(body, sewn):
+            if body != 1:
+                return sewn
+            rebuilt = TopoDS_Shell()
+            builder = BRep_Builder()
+            builder.MakeShell(rebuilt)
+            for k, face in enumerate(explore(sewn, TopAbs_FACE)):
+                builder.Add(rebuilt, face.Reversed() if k == 0 else face)
+            return rebuilt
+        with self.sew_then(reverse_one):
+            c, _ = self.refused_like_today(fixture_faces, "orientation")
+        self.assertIn("component 1", c.nonmanifold_split_refusals[0]["reason"])
+
+    def test_orientation_check_refuses_a_reversed_face(self):
+        """``_orientation_kept`` alone: kept faces pass; a built face given the opposite orientation is refused."""
+        from cq_acis import _nonmanifold_split as S
+        faces = fixture_faces()
+        built = [faces[face] for face in ROD]
+        sewn, mapping = S._sew_body(built)
+        S._orientation_kept(sewn, list(zip(built, mapping)))
+        for k in range(len(built)):
+            with self.subTest(reversed_face=k):
+                pairs = list(zip(built, mapping))
+                pairs[k] = (built[k].Reversed(), mapping[k])
+                with self.assertRaises(S._Refused) as caught:
+                    S._orientation_kept(sewn, pairs)
+                self.assertIn("as-built orientation", str(caught.exception))
+
+    def test_tolerance_raised_by_sharing_refused(self):
+        """After the loop is shared a body holds a larger tolerance than the sewn one did: refused."""
+        from OCP.BRep import BRep_Builder
+        from OCP.TopAbs import TopAbs_EDGE
+        from OCP.TopoDS import TopoDS
+        from cq_acis import _nonmanifold_split as S
+        real = S._share_loop
+
+        def raising(*args):
+            count, sx, sy, *rest = real(*args)
+            BRep_Builder().UpdateEdge(TopoDS.Edge_s(explore(sx, TopAbs_EDGE)[0]), 1e-4)
+            return (count, sx, sy, *rest)
+        with mock.patch(f"{SPLIT}._share_loop", side_effect=raising):
+            self.refused_like_today(fixture_faces, "raised a tolerance")
+
+    def test_shared_edge_tolerance_changed_refused(self):
+        """The shared loop edge comes out of ``UpdateEdge`` with another tolerance than its source edge: refused."""
+        from OCP.BRep import BRep_Builder, BRep_Tool
+        from OCP.ShapeBuild import ShapeBuild_Edge
+
+        class RaisingCopier:
+            def __init__(self):
+                self.real = ShapeBuild_Edge()
+
+            def Copy(self, edge, share):
+                copy = self.real.Copy(edge, share)
+                BRep_Builder().UpdateEdge(copy, BRep_Tool.Tolerance_s(copy) + 1e-6)
+                return copy
+
+            def __getattr__(self, name):
+                return getattr(self.real, name)
+        with mock.patch("OCP.ShapeBuild.ShapeBuild_Edge", RaisingCopier):
+            self.refused_like_today(fixture_faces, "tolerance changed")
+
+    @staticmethod
+    def raise_tolerances(sewn, z_low, z_high, edges=None, vertices=None):
+        """Raise the tolerance of the shell's edges lying entirely, and vertices lying, in z_low <= z <= z_high."""
+        from OCP.BRep import BRep_Builder, BRep_Tool
+        from OCP.BRepAdaptor import BRepAdaptor_Curve
+        from OCP.TopAbs import TopAbs_EDGE, TopAbs_VERTEX
+        from OCP.TopoDS import TopoDS
+        builder = BRep_Builder()
+        if edges:
+            for shape in explore(sewn, TopAbs_EDGE):
+                edge = TopoDS.Edge_s(shape)
+                curve = BRepAdaptor_Curve(edge)
+                first, last = curve.FirstParameter(), curve.LastParameter()
+                if all(z_low <= curve.Value(first + (last - first) * k / 4).Z() <= z_high for k in range(5)):
+                    builder.UpdateEdge(edge, edges)
+        if vertices:
+            for shape in explore(sewn, TopAbs_VERTEX):
+                vertex = TopoDS.Vertex_s(shape)
+                if z_low <= BRep_Tool.Pnt_s(vertex).Z() <= z_high:
+                    builder.UpdateVertex(vertex, vertices)
+
+    def test_loop_edge_tolerance_above_its_partners_refused(self):
+        """Per element, not per body maximum: the first body's loop edges carry 1e-6 mm, the second body's 1e-7 mm,
+        and a further edge of the second body 1e-5 mm. Sharing would raise the second body's loop edges to 1e-6 mm
+        below that body's maximum: refused."""
+        def mutate(body, sewn):
+            if body == 0:
+                self.raise_tolerances(sewn, -1e-6, 1e-6, edges=1e-6)
+            else:
+                self.raise_tolerances(sewn, H_SLEEVE - 1e-6, H_SLEEVE + 1e-6, edges=1e-5)
+            return sewn
+        with self.sew_then(mutate):
+            self.refused_like_today(fixture_faces, "raise the second body's loop edge tolerance")
+
+    def test_loop_vertex_tolerance_above_its_partners_refused(self):
+        """The same for the loop vertices the second body takes over from the first."""
+        def mutate(body, sewn):
+            if body == 0:
+                self.raise_tolerances(sewn, -1e-6, 1e-6, vertices=1e-6)
+            else:
+                self.raise_tolerances(sewn, H_SLEEVE - 1e-6, H_SLEEVE + 1e-6, vertices=1e-5)
+            return sewn
+        with self.sew_then(mutate):
+            self.refused_like_today(fixture_faces, "raise the second body's loop vertex tolerance")
 
     def test_cavity_shell_in_the_lump_refused(self):
         """A lump with a further (cavity) shell: the split is refused, so the lump reports as today."""
@@ -616,7 +905,7 @@ class NonmanifoldSplitTests(unittest.TestCase):
         entities[SHELL] = ShellEntity(shell.raw, shell.pattern, EntityRef(extra), shell.subshell, shell.face,
                                       shell.wire, shell.lump)
         model = AcisModel(model.metadata, tuple(entities))
-        self.refused_like_today(fixture_faces(), "cavity", model=model)
+        self.refused_like_today(fixture_faces, "cavity", model=model)
 
 
 if __name__ == "__main__":
