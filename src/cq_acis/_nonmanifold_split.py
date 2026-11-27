@@ -1,4 +1,4 @@
-"""dwg2glb (M4b F5, rulings R200 / R202 / R203): split a shell at non-manifold source edges into body-consistent solids.
+"""Split a shell at non-manifold source edges into body-consistent solids.
 
 simple-stairs 22B8 (5 definitions, 320 occurrences) is one ACIS shell holding two bodies, a rod and a sleeve, that
 meet only along one circle: the source edge ``$692``, whose ring has 4 coedges (rod side, rod top, sleeve bore,
@@ -49,7 +49,7 @@ attempt's closure records are cut back, the reason is recorded in ``converter.no
 path (``makeShell`` of all faces, ending in today's result or refusal) runs. An accepted split is recorded in
 ``converter.nonmanifold_splits`` (``shell``, ``edges``, ``bodies``, ``volumes``, ``shared_loop_edges``,
 ``loop_edge_splits``, ``parameter_shifts``, ``method``);
-no dwg2glb schema change. A shell without a > 2-coedge source edge never reaches the split (``nonmanifold_rings``
+A shell without a > 2-coedge source edge never reaches the split (``nonmanifold_rings``
 returns {}), so every shell M4 converts takes exactly today's path (census: 0 of 2,037 emitted definitions has such an
 edge). Only the outer shell of a lump without cavity shells is split (``_lump``: "cavities in a split non-manifold
 shell are not supported" stays).

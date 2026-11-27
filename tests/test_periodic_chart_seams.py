@@ -1,4 +1,4 @@
-"""dwg2glb: chart seams for periodic cylinder/cone faces without one (synthetic geometry only).
+"""Chart seams for periodic cylinder/cone faces without one (synthetic geometry only).
 
 A periodic face whose boundary has no seam coedge is unorientable for OCCT. The seam has to be added at a
 parameter clear of every source vertex and hole, keeping every oriented source curve and trim interval; any face
@@ -12,7 +12,7 @@ import unittest
 from unittest import mock
 
 import cq_acis as a
-from cq_acis.cadquery import _Placement
+from cq_acis.cadquery import _Placement, _STORED_FIT_MARGIN
 from test_m4_geometry import raw, cone
 
 N, R = a.NULL_REF, a.EntityRef
@@ -383,7 +383,7 @@ class StoredFitSeamTests(SeamChecks):
                 self.assert_qualified_seam(c, model, face, 2 * math.pi * 2. * 4., 0,
                                            radial_sign=-1. if reversed_face else 1.,
                                            normal_at=((0., 2., 2.), (0., 1., 0.)),
-                                           edge_limit=c.tolerance + 2e-3 + 1e-9)  # + 2 x the saved fit tolerance
+                                           edge_limit=c.tolerance + _STORED_FIT_MARGIN * 1e-3 + 1e-9)  # margin x the saved fit tolerance
                 # Left to the heal (not withheld), this synthetic band is repaired by it and takes no new seam.
                 healed = a.CadQueryConverter(model)
                 self.assertTrue(healed._face(model.entities[0], _Placement(None, 1.)).isValid())

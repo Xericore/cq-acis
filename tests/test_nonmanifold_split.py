@@ -1,4 +1,4 @@
-"""dwg2glb (M4b F5, rulings R200 / R202 / R203): a shell with a non-manifold source edge split into body-consistent solids.
+"""A shell with a non-manifold source edge split into body-consistent solids.
 
 simple-stairs 22B8 (5 definitions, 320 occurrences): one ACIS shell holds a rod and a sleeve that meet only along one
 circle, the source edge `$692` with a ring of 4 coedges (rod side, rod top, sleeve bore, sleeve bottom). Sewing all
@@ -636,7 +636,7 @@ class NonmanifoldSplitTests(unittest.TestCase):
             self.assertLess(abs(math.hypot(p.X(), p.Y()) - R_ROD), 1e-9)
         # No tolerance was raised.
         self.assertLessEqual(max_tolerance([result.wrapped]), max_tolerance(list(faces.values())))
-        # Recorded (no dwg2glb schema change): one split per shell, with its edges, bodies and volumes.
+        # One split is recorded per shell, with its edges, bodies and volumes.
         _, edge_ids = topology_model(TWO_BODY_LOOPS)
         self.assertEqual(len(c.nonmanifold_splits), 1)
         split = c.nonmanifold_splits[0]

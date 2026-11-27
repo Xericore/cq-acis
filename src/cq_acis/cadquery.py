@@ -223,7 +223,7 @@ def _load_occt_shapes():
 BACKENDS = ("auto", "cadquery", "occt")
 # Boundaries of a face on a stored fit are accepted within this multiple of
 # the fit tolerance saved with it (plus the model tolerance).
-_STORED_FIT_MARGIN = 2.0
+_STORED_FIT_MARGIN = 3.0
 
 
 def _load_backend(backend: str):
@@ -260,9 +260,15 @@ class CadQueryConverter:
     ``TopoDS_Shape``) without importing CadQuery, and ``"auto"`` (default) uses
     CadQuery when installed and OCCT otherwise. The geometry that is accepted
     and the checks that are applied do not depend on the backend.
+
+    ``stored_fit_margin`` scales only the allowance for trims on or of a stored fit.
+    Larger values opt into approximate geometry; exact trims keep their usual checks.
     """
 
-    def __init__(self, model: AcisModelView, *, backend: str = "auto"):
+    def __init__(self, model: AcisModelView, *, backend: str = "auto", stored_fit_margin: float = _STORED_FIT_MARGIN):
+        if type(stored_fit_margin) not in (int, float) or not 0.0 < stored_fit_margin <= 64.0:
+            raise ValueError("stored_fit_margin must be a finite number in (0, 64]")
+        self._stored_fit_margin = stored_fit_margin
         # CadQuery walks the same references repeatedly. Materialize the Python
         # view once instead of copying native entity fields on every lookup.
         if isinstance(model, NativeModel):
@@ -281,6 +287,7 @@ class CadQueryConverter:
         self.cylinder_slit_faces: list[dict] = []
         self.shell_closure_checks: list[dict] = []
         self.tolerant_endpoints: list[dict] = []
+        self.edge_vertex_seats: list[dict] = []  # see _seat_edge_vertices
         self.tolerant_boundaries: list[dict] = []
         self.bounded_surface_faces: list[dict] = []
         self.saved_pcurves: list[dict] = []
@@ -305,16 +312,16 @@ class CadQueryConverter:
         self._approximation_tolerances: dict[int, float] = {}
         self._approximation_closures: dict[int, tuple[int, int]] = {}
         self.subtype_failures: dict[int, str] = {}
-        # dwg2glb (M4b F7): stored-fit faces closed on a collapsed pole row (_singular_rows), and refusals.
+        # Stored-fit faces closed on a collapsed pole row (_singular_rows), and refusals.
         self.singular_row_faces: list[dict] = []
         self.singular_row_refusals: list[dict] = []
         self._row_join_candidates: list[dict] = []
         self._row_insertions = None
         self._row_insertion_records: list[dict] = []
-        # dwg2glb (M4b F7, R205): partner edges split at a FixMissingSeam seam vertex (_seam_junctions), and refusals.
+        # Partner edges split at a FixMissingSeam seam vertex (_seam_junctions), and refusals.
         self.seam_junction_splits: list[dict] = []
         self.seam_junction_refusals: list[dict] = []
-        # dwg2glb (M4b F5, R202): shells split at a > 2-coedge source edge into body-consistent solids
+        # Shells split at a > 2-coedge source edge into body-consistent solids
         # (_nonmanifold_split), and refusals.
         self.nonmanifold_splits: list[dict] = []
         self.nonmanifold_split_refusals: list[dict] = []
@@ -567,6 +574,7 @@ class CadQueryConverter:
             if not builder.IsDone():
                 raise CadQueryConversionError("tolerant source line construction failed")
             result = self.cq.Edge(builder.Edge())
+            self._seat_edge_vertices(result, edge, placement)  # lines at tolerant vertices
             return self._reverse_edge(result) if edge.reversed ^ coedge.reversed else result
         start = self._vertex_point(
             edge.start_vertex, placement, context=f"edge ${edge.index} start"
@@ -690,11 +698,42 @@ class CadQueryConverter:
             raise CadQueryConversionError(
                 f"edge ${edge.index}: CadQuery could not build the circle arc"
             ) from error
+        self._seat_edge_vertices(result, edge, placement)
         if reverse_for_edge:
             result = self._reverse_edge(result)
         if coedge.reversed:
             result = self._reverse_edge(result)
         return result
+
+    def _seat_edge_vertices(self, result, edge: EdgeEntity, placement: _Placement) -> None:
+        """Put an analytic edge's OCCT vertex on its source vertex when the edge built from the saved parameters
+        ends more than OCCT's confusion (1e-7) but no more than the model
+        resolution (``self.tolerance``, resabs) from it. The vertex tolerance becomes that gap, so the arc's own end
+        stays inside it; neighbours that share the source vertex then meet within OCCT's tolerance and the loop
+        closes. The curve and the parameters are unchanged; a larger gap is left alone (the loop stays open and the
+        conversion fails as before)."""
+        from OCP.BRep import BRep_Builder, BRep_Tool
+        from OCP.Precision import Precision
+        from OCP.gp import gp_Pnt
+
+        confusion = Precision.Confusion_s()
+        references = (edge.start_vertex, edge.end_vertex)
+        seated = set()
+        for vertex in result.Vertices():
+            actual = Vec3(*vertex.Center().toTuple())
+            targets = [(reference, placement.point_vector(self._vertex_location(
+                reference, context=f"edge ${edge.index} arc vertex"))) for reference in references]
+            reference, target = min(targets, key=lambda item: (item[1] - actual).magnitude)
+            gap = (target - actual).magnitude
+            if not math.isfinite(gap) or gap <= confusion or gap > self.tolerance or reference.index in seated:
+                continue
+            limit = min(self.tolerance, max(gap + 64 * math.ulp(max(1., abs(target.x), abs(target.y), abs(target.z))),
+                                            BRep_Tool.Tolerance_s(vertex.wrapped)))
+            BRep_Builder().UpdateVertex(vertex.wrapped, gp_Pnt(target.x, target.y, target.z), limit)
+            seated.add(reference.index)
+            self.edge_vertex_seats.append({"edge": edge.index, "vertex": reference.index, "gap_mm": gap,
+                                          "tolerance_mm": limit, "method": "seat edge vertex on source vertex "
+                                          "within model resolution; curve and parameters unchanged"})
 
     def _edge(self, coedge: CoedgeEntity, placement: _Placement):
         if coedge.raw.type_name == "tcoedge-coedge":
@@ -1108,6 +1147,9 @@ class CadQueryConverter:
             mults.SetValue(i, mult)
         return Geom2d_BSplineCurve(poles, knots, mults, view.degree, False), view
 
+    def _stored_fit_limit(self, allowance: float) -> float:
+        return self.tolerance + allowance * self._stored_fit_margin
+
     def _saved_pcurve_tolerance(self, coedge, saved, placement):
         """Observed ASM 22700 TEDGE allowance, scoped to a checked saved pcurve.
 
@@ -1286,7 +1328,7 @@ class CadQueryConverter:
                 if allowance:
                     # The saved fit tolerance is the modeller's own estimate; an
                     # exact boundary may sit slightly further from the fit.
-                    limit = max(limit, self.tolerance + allowance * _STORED_FIT_MARGIN)
+                    limit = max(limit, self._stored_fit_limit(allowance))
                     if not check.IsDone() or not math.isfinite(check.MaxDistance()) or check.MaxDistance() > limit:
                         # OCCT's projector can fail on a fitted curve or support
                         # (a seam crossing, a slightly off-surface curve). Sample
@@ -1347,7 +1389,7 @@ class CadQueryConverter:
                             surface, previous_end, join, max(previous_limit, limit)):
                         singular.append((i, previous_end, join, surface.Value(*join), max(previous_limit, limit)))
                     elif allowance or previous_allowance:
-                        # dwg2glb (M4b F7): a gap the singular-point test refused; _singular_rows may close it.
+                        # A gap the singular-point test refused; _singular_rows may close it.
                         self._row_join_candidates.append(dict(loop=loop_index, position=i,
                             previous=list(previous_end), join=list(join), limit=max(previous_limit, limit),
                             previous_coedge=coedges[i-1], coedge=coedge))
@@ -1421,7 +1463,7 @@ class CadQueryConverter:
                     singular.append((len(edges), previous_end, closing, surface.Value(*closing),
                                      max(previous_limit, first_limit)))
                 elif previous_allowance or first_allowance:
-                    # dwg2glb (M4b F7): see the in-loop join above.
+                    # See the in-loop join above.
                     self._row_join_candidates.append(dict(loop=loop_index, position=len(edges),
                         previous=list(previous_end), join=list(closing), limit=max(previous_limit, first_limit),
                         previous_coedge=coedges[-1], coedge=coedges[0]))
@@ -1553,7 +1595,7 @@ class CadQueryConverter:
                 edges, surface_geometry, loop_index=loop.index, coedges=coedges, placement=placement
             )
             if self._row_insertions is not None and loop.index in self._row_insertions:
-                # dwg2glb (M4b F7): only while _singular_rows.close_collapsed_rows rebuilds a qualified face.
+                # Only while _singular_rows.close_collapsed_rows rebuilds a qualified face.
                 from ._singular_rows import row_insertion
                 edges = row_insertion(self, loop, edges, surface_geometry.surface,
                                       self._row_join_candidates[mark:], singular)
@@ -1728,7 +1770,7 @@ class CadQueryConverter:
         if slit_face is not None:
             # The slit builder already orients the face by its lower rim's coedge
             # direction (the ACIS loop rule, which carries the face sense); a
-            # further flip would apply the sense twice (dwg2glb 0003).
+            # further flip would apply the sense twice.
             return slit_face
         apex_face = self._cone_apex_face(face, surface, loops, placement, geometry)
         if apex_face is not None:
@@ -1790,7 +1832,7 @@ class CadQueryConverter:
             ) from error
         # ACIS cone sense: away from the axis for cos > 0, toward it for cos < 0;
         # the OCCT surface (frame axis axis*cos) always points away, and
-        # surface.reversed is ACIS reverse_u, a parameter direction (dwg2glb 0003).
+        # surface.reversed is ACIS reverse_u, a parameter direction.
         if face.reversed != (surface.cos_half_angle < 0):
             result = self._reverse_face(result)
         return result
@@ -2018,7 +2060,7 @@ class CadQueryConverter:
             return None
         boundaries = []
         signed_radius = surface.radius if isinstance(surface, SphereSurfaceEntity) else surface.minor_radius
-        # A torus's Boolean is ACIS reverse_v, a parameter direction; the sphere's is kept (dwg2glb 0003).
+        # A torus's Boolean is ACIS reverse_v, a parameter direction; the sphere's is kept.
         flip = face.reversed ^ (isinstance(surface, SphereSurfaceEntity) and surface.reversed) ^ (signed_radius < 0)
         for loop in loops:
             coedge = self._coedges(loop)[0]
@@ -2301,12 +2343,12 @@ class CadQueryConverter:
         deferred = self._deferred_periodic_seams.pop(face.index, None)
         if deferred is not None and not result.isValid():
             # A face bounded by stored fits is offered to the heal above first, unchanged; only a face it
-            # leaves invalid gets the qualified periodic chart seam (dwg2glb).
+            # leaves invalid gets the qualified periodic chart seam.
             from ._analytic_seams import periodic_seam_after_heal
             result = periodic_seam_after_heal(self, face, deferred, result)
         if (not result.isValid() and isinstance(surface, BSplineSurfaceEntity) and self._row_join_candidates
                 and self._approximation_tolerance(surface)):
-            # dwg2glb (M4b F7): a stored fit collapsing a band of end pole rows; fallback only (_singular_rows).
+            # A stored fit collapsing a band of end pole rows; fallback only (_singular_rows).
             from ._singular_rows import close_collapsed_rows
             result = close_collapsed_rows(self, face, surface, loops, placement, result)
         if not result.isValid():
@@ -2388,7 +2430,7 @@ class CadQueryConverter:
                 )
         try:
             built = [self._face(face, placement) for face in faces]
-            # dwg2glb (M4b F5, R202): only a shell with a source edge of more than 2 coedges is split, before
+            # Only a shell with a source edge of more than 2 coedges is split, before
             # today's sewing; a refusal (None) continues on today's path unchanged (_nonmanifold_split).
             from ._nonmanifold_split import nonmanifold_rings, split_nonmanifold_shell
             rings = nonmanifold_rings(self, faces)
@@ -2409,7 +2451,7 @@ class CadQueryConverter:
         except CadQueryConversionError as error:
             if error.code != "geometry.shell_open":
                 raise
-            # dwg2glb (M4b F7, R205): fallback only, after the existing path refused the shell as open; a refusal
+            # Fallback only, after the existing path refused the shell as open; a refusal
             # (None) re-raises today's error unchanged (_seam_junctions).
             from ._seam_junctions import split_seam_junctions
             components = split_seam_junctions(self, shell, faces, built, checks)

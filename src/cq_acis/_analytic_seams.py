@@ -1,6 +1,6 @@
 """Qualified chart seams for cylindrical faces with two winding boundaries.
 
-dwg2glb: ``periodic_seam_face`` extends this to circular cylinder and cone faces with any loop count and any
+``periodic_seam_face`` extends this to circular cylinder and cone faces with any loop count and any
 boundary curve (two opposite rim windings plus non-winding holes), with a seam parameter clear of every source
 vertex and hole; a face it does not qualify stays ``geometry.face_invalid``.
 """
@@ -260,7 +260,7 @@ def _check_seam_boundaries(converter, result, surface, boundaries):
                 seam_edges=len(seams), max_deviation_mm=maximum, tolerance_mm=converter.tolerance)
 
 
-# ---------------------------------------------------------------- dwg2glb: periodic faces without a chart seam
+# ---------------------------------------------------------------- periodic faces without a chart seam
 
 # The seam keeps this multiple of the face's largest edge/vertex tolerance away from every source vertex and
 # every hole, so that no split point of the seam can be merged with, or mistaken for, a source vertex.
@@ -321,7 +321,7 @@ def periodic_seam_face(converter, face, loops, wires, geometry, placement, *, af
         result, record = _compose_periodic_seam(converter, wires if after_heal else copied(wires), geometry)
         converter.periodic_seam_faces.append(dict(face=face.index, loops=[loop.index for loop in loops],
             edges=[co.edge.index for loop in loops for co in converter._coedges(loop)],
-            method=('dwg2glb periodic chart seam clear of every source vertex and hole; exact-inverse UV curves; '
+            method=('periodic chart seam clear of every source vertex and hole; exact-inverse UV curves; '
                     'unchanged oriented 3D curves and complete trim intervals'),
             after_heal=after_heal, **record))
         return result

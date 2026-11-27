@@ -1,4 +1,4 @@
-"""dwg2glb (M4b F7, ruling R205): close a shell left open by the T-junction of a FixMissingSeam seam vertex.
+"""Close a shell left open by the T-junction of a FixMissingSeam seam vertex.
 
 The M4 heal ``_heal_approximated_face`` lets ``ShapeFix_Face.FixMissingSeam`` add the chart seam of a periodic face
 bounded by stored fits. Where the seam meets a boundary loop inside a source edge, the healed face carries that edge

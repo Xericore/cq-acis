@@ -1,4 +1,4 @@
-"""dwg2glb (M4b F7): close a stored-fit face whose fit collapses a band of end pole rows.
+"""Close a stored-fit face whose fit collapses a band of end pole rows.
 
 ASM saves some `rb_blend_spl_sur` fits whose end pole rows collapse to the apex of a three-sided face; the fit's
 singularity code (1 = low, 2 = high) names that end. The two apex coedges meet the collapsed row at different free
